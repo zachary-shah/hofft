@@ -103,6 +103,8 @@ def als_iterations(phase_model: linop,
                    apods_init: torch.Tensor,
                    mask: Optional[torch.Tensor] = None,
                    max_iter: Optional[int] = 100,
+                   tol: float = 5e-3,
+                   check_convergence: bool = True,
                    verbose: Optional[bool] = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform ALS iterations to solve for apodization functions and weights.
@@ -139,8 +141,10 @@ def als_iterations(phase_model: linop,
         return weights, apods_init
     
     # Stopping criteria
-    kwargs_allclose = {'atol': 0.0, 'rtol': 1e-2}
-    
+    if check_convergence:
+        weight_diff = torch.inf
+        apod_diff = torch.inf
+
     # Momentum term
     # momentum = lambda k : k / (k + 3)
     momentum = lambda k : .8
@@ -149,7 +153,8 @@ def als_iterations(phase_model: linop,
     # ALS till max_iter
     apods_prev = apods_init
     weights_prev = None
-    for k in tqdm(range(max_iter), 'ALS iterations', disable=not verbose):
+    pbar = tqdm(total=max_iter, desc='ALS iterations', disable=not verbose)
+    for k in range(max_iter):
         
         # ALS weight updates
         weights = lstsq_temporal(phase_model, kern_bases, apods_prev, mask=mask)
@@ -162,17 +167,26 @@ def als_iterations(phase_model: linop,
         if k > k0:
             apods = apods + beta * (apods_prev - apods)
         
-        # Check convergence
-        if k > 0 and \
-            torch.allclose(weights, weights_prev, **kwargs_allclose) and \
-            torch.allclose(apods, apods_prev, **kwargs_allclose):
-            break
+        # check convergence
+        if check_convergence:
+            if weights_prev is not None:
+                weight_diff = torch.norm(weights - weights_prev) / (torch.norm(weights_prev) + 1e-8)
+                apod_diff = torch.norm(apods - apods_prev) / (torch.norm(apods_prev) + 1e-8)
+            else:
+                weight_diff = torch.inf
+                apod_diff = torch.inf
+            pbar.set_postfix({'weight_diff': f'{weight_diff:.3e}', 'apod_diff': f'{apod_diff:.3e}'})
+            if (weight_diff < tol and apod_diff < tol):
+                pbar.set_description(f'Converged after {k} iterations')
+                break
         
         # Update previous values
         weights_prev = weights
         apods_prev = apods
-        
-        
+
+        pbar.update(1)
+    pbar.close()
+
     return weights, apods
     
 def lstsq_spatial(phase_model: linop, 

@@ -1,9 +1,9 @@
 import torch
 import numpy as np
-
+from typing import Optional
 from einops import einsum
 
-from mr_recon.utils import gen_grd, pick_K_vectors
+from mr_recon.utils import gen_grd, quantize_data
 from mr_recon.algs import eigen_decomp_operator
 from mr_recon.imperfections.field import alpha_segementation
 from mr_recon.linops import type3_nufft_naive, type3_nufft
@@ -12,12 +12,69 @@ from mr_recon.dtypes import complex_dtype
 from hofft.als import als_iterations
 from hofft.model import hofft_params
 
+def pick_K_vectors(vectors: torch.Tensor,
+                   K: int,
+                   sigma: Optional[float] = 0.0,
+                   method: Optional[str] = 'minmax') -> torch.Tensor:
+    """
+    Given N vectors, pick K represenative vectors that are far apart from each other.
+    
+    Args
+    ----
+    vectors : torch.Tensor
+        Vectors to pick from with shape (N, d) 
+    K : int
+        Number of vectors to pick
+    sigma : float
+        Adds noise to N vectors to 'blur out' the distribution
+    method : str
+        'kmeans' will use k-means clustering to pick the vectors.
+        'random' will pick K random vectors from the input.
+        'minmax' will pick K vectors that are farthest apart from each other.
+        'convhull' TODO need to implement this.
+        
+    Returns
+    -------
+    kvectors : torch.Tensor
+        K vectors with shape (K, d)
+    idxs : torch.Tensor
+        Indices of the picked vectors in the original input with shape (K,) in [0, N)
+    """
+    # Consts
+    N, d = vectors.shape
+    assert N > K, f'N={N} is not greater than K={K}.'
+    
+    # Add noise
+    vectors_noisy = vectors + torch.randn_like(vectors) * sigma
+    
+    # Kmeans clustering
+    if method == 'kmeans':
+        kvectors, idxs = quantize_data(data=vectors_noisy, K=K, method='cluster')
+    elif method == 'random':
+        idxs = torch.randperm(N)[:K]
+        kvectors = vectors_noisy[idxs]
+    elif method == 'minmax':
+        picked = [torch.randint(0, N, (1,))]
+        dist = torch.linalg.norm(vectors_noisy - vectors_noisy[picked], dim=-1)
+        for _ in range(1, K):
+            nxt = torch.argmax(dist)
+            picked.append(nxt)
+            dist = torch.minimum(dist, torch.linalg.norm(vectors_noisy - vectors_noisy[nxt], dim=-1))
+        idxs = torch.tensor(picked, dtype=torch.long, device=vectors_noisy.device)
+        kvectors = vectors_noisy[idxs]
+    else:
+        raise ValueError(f'Unknown method {method}.')
+        
+    return kvectors, idxs
+
 def K_alphas_apod_init(phis: torch.Tensor,
                        alphas: torch.Tensor,
                        hparams: hofft_params,
                        method: str = 'minmax',
                        apod_init_method: str = 'eigen',
                        num_als_iter: int = 100,
+                       check_convergence: bool = True,
+                       verbose: bool = True,
                        K: int = 500,) -> torch.Tensor:
     """
     Initialize apodizations by running ALS on K representative alphas.
@@ -82,7 +139,8 @@ def K_alphas_apod_init(phis: torch.Tensor,
     # ALS agorithm
     _, apods = als_iterations(t3n, kern_bases, apods_init_init, 
                               max_iter=num_als_iter,
-                              verbose=True)
+                              check_convergence=check_convergence,
+                              verbose=verbose)
     
     return apods
     

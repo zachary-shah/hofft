@@ -4,8 +4,8 @@ import numpy as np
 from mr_recon.linops import linop, batching_params
 from mr_recon.utils import gen_grd, batch_iterator, resize
 from mr_recon.fourier import fft, ifft
-from mr_recon._func.indexing import multi_index, multi_grid
-from mr_recon._func.pad import PadLast
+from mr_recon.indexing import multi_index, multi_grid
+from mr_recon.pad import PadLast
 from .kb import _gen_kern_vectors
 
 from typing import Optional, Union
@@ -25,6 +25,7 @@ class hofft_params:
     apods_init: Union[torch.Tensor, str] = 'seg'
     use_type3: bool = False
     verbose: bool = True
+    check_convergence: bool = True
     """
     Parameters for HOFFT models.
     
@@ -167,7 +168,7 @@ class multi_apod_kern_linop(linop):
             
             # Oversampled FFT
             MSx = self.padder(MSx)
-            FMSx = fft(MSx, dim=tuple(range(-D, 0))) / torch.tensor(self.im_size).prod().sqrt()
+            FMSx = fft(MSx, dim=tuple(range(-D, 0)))
             
             # Extract blocks of k-space data
             blocks = multi_index(FMSx, D, self.idx_kerns) # (C, L, *trj_size, K)
@@ -211,7 +212,7 @@ class multi_apod_kern_linop(linop):
             
             # Gridding 
             Ky = multi_grid(Ky, self.idx_kerns, self.im_size_os) # (C, L, *im_size_os)
-            FKy = ifft(Ky, dim=tuple(range(-D, 0))) / torch.tensor(self.im_size_os).prod().sqrt()
+            FKy = ifft(Ky, dim=tuple(range(-D, 0)))
             FKy = self.padder.adjoint(FKy) # (C, L, *im_size)
             
             # Apply adjoint sensitivity maps

@@ -280,6 +280,8 @@ def als_hofft(phis: torch.Tensor,
     apods_init = hparams.apods_init
     use_type3 = hparams.use_type3
     verbose = hparams.verbose
+    check_convergence = hparams.check_convergence # adds like 15% extra penalty on apod init time
+    
     
     # Make kernel bases
     rs = gen_grd(solve_size).to(torch_dev)
@@ -301,11 +303,22 @@ def als_hofft(phis: torch.Tensor,
             apods = eigen_apod_init(phis, alphas, hparams)
         elif 'seg' in apods_init:
             apods = alpha_seg_apod_init(phis, alphas, hparams)
-        elif re.fullmatch(r"\d+_alphas", apods_init):
+        elif re.fullmatch(r"\d+_alphas_\d+", apods_init):
+            K = int(apods_init.split('_')[0])
+            num_iter = int(apods_init.split('_')[-1])
+            apods = K_alphas_apod_init(phis, alphas, hparams, 
+                                       method='minmax',
+                                       apod_init_method='seg',
+                                       check_convergence=check_convergence,
+                                       verbose=verbose,
+                                       num_als_iter=num_iter, K=K)
+        elif re.fullmatch(r"\d+_alphas+", apods_init):
             K = int(apods_init.split('_')[0])
             apods = K_alphas_apod_init(phis, alphas, hparams, 
                                        method='minmax',
                                        apod_init_method='seg',
+                                       check_convergence=check_convergence,
+                                       verbose=verbose,
                                        num_als_iter=100, K=K)
         else:
             raise ValueError(f'Invalid apods_init {apods_init}. Supported methods are seg, eigen, and k_alphas.')
@@ -313,7 +326,7 @@ def als_hofft(phis: torch.Tensor,
         raise ValueError("apods_init must be a torch.Tensor or a string")
 
     # ALS to solve for weights and apods
-    weights, apods = als_iterations(t3n, kern_bases, apods, max_iter=num_als_iter, verbose=verbose)
+    weights, apods = als_iterations(t3n, kern_bases, apods, max_iter=num_als_iter, check_convergence=check_convergence, verbose=verbose)
 
     # Interpolate spatial funcs
     kwargs = {'order': 3, 'mode': 'nearest'}
