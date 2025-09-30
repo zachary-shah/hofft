@@ -285,7 +285,12 @@ def als_hofft(phis: torch.Tensor,
     
     # Make kernel bases
     rs = gen_grd(solve_size).to(torch_dev)
-    kern = gen_grd(kern_size, kern_size).to(torch_dev).reshape((-1, d)) / os
+    kern = gen_grd(kern_size, kern_size).to(torch_dev).reshape((-1, d)) 
+    if isinstance(os, float):
+        kern = kern / os
+    else:
+        os_tensor = torch.tensor(os, device=torch_dev)
+        kern = kern / os_tensor[None,]
     phz = einsum(kern, rs, 'K D, ... D -> K ...')
     kern_bases = torch.exp(-2j * np.pi * phz)
     

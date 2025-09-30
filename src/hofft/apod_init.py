@@ -113,7 +113,13 @@ def K_alphas_apod_init(phis: torch.Tensor,
     # Prep ALS algorithm
     rs = gen_grd(im_size).to(torch_dev)
     kern = gen_grd(kern_size, kern_size).to(torch_dev)
-    kern = kern.reshape((-1, d)) / os
+    kern = kern.reshape((-1, d))
+    if isinstance(os, float):
+        kern = kern / os
+    else:
+        os_tensor = torch.tensor(os, device=torch_dev)
+        kern = kern / os_tensor[None,]
+
     kern_bases = torch.exp(-2j * np.pi * einsum(kern, rs,
                                                 'K d, ... d -> K ...'))
     

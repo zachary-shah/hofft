@@ -105,6 +105,7 @@ def als_iterations(phase_model: linop,
                    max_iter: Optional[int] = 100,
                    tol: float = 5e-3,
                    check_convergence: bool = True,
+                   solver = 'pinv',
                    verbose: Optional[bool] = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform ALS iterations to solve for apodization functions and weights.
@@ -137,7 +138,7 @@ def als_iterations(phase_model: linop,
         
     # Weights only 
     if max_iter == 0:
-        weights = lstsq_temporal(phase_model, kern_bases, apods_init, mask=mask)
+        weights = lstsq_temporal(phase_model, kern_bases, apods_init, mask=mask, solver=solver)
         return weights, apods_init
     
     # Stopping criteria
@@ -157,13 +158,13 @@ def als_iterations(phase_model: linop,
     for k in range(max_iter):
         
         # ALS weight updates
-        weights = lstsq_temporal(phase_model, kern_bases, apods_prev, mask=mask)
+        weights = lstsq_temporal(phase_model, kern_bases, apods_prev, mask=mask, solver=solver)
         if k > k0:
             beta = momentum(k)
             weights = weights + beta * (weights_prev - weights)
         
         # ALS apodization updates
-        apods = lstsq_spatial(phase_model, kern_bases, weights, mask=mask)
+        apods = lstsq_spatial(phase_model, kern_bases, weights, mask=mask, solver=solver)
         if k > k0:
             apods = apods + beta * (apods_prev - apods)
         
@@ -321,7 +322,7 @@ def lstsq_temporal(phase_model: linop,
     if mask is None:
         mask = torch.ones(im_size, dtype=complex_dtype, device=torch_dev)
     
-    bases = einsum(kern_bases, apods, 'K ..., L ... -> L K ...') * mask
+    bases = (kern_bases[None,] * apods[:, None]) * mask
     AHA = torch.zeros((L, K, L, K), dtype=kern_bases.dtype, device=kern_bases.device)
     AHB = torch.zeros((L, K, *trj_size), dtype=kern_bases.dtype, device=kern_bases.device)
     
@@ -337,7 +338,6 @@ def lstsq_temporal(phase_model: linop,
         lk2 = min(lk1 + lk_batch_size, L*K)
         ls = linds[lk1:lk2]
         ks = kinds[lk1:lk2]
-
         AHA[ls, ks] += einsum(bases[ls, ks].conj(), bases, 'lk ..., L K ... -> lk L K')
         temp_batch = phase_model.forward(bases[ls, ks].conj()) # (L K) *trj_size
         AHB[ls, ks, ...] += temp_batch

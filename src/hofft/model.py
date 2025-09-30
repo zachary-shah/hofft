@@ -8,7 +8,7 @@ from mr_recon.indexing import multi_index, multi_grid
 from mr_recon.pad import PadLast
 from .kb import _gen_kern_vectors
 
-from typing import Optional, Union
+from typing import Optional, Union, Sequence 
 from einops import einsum, rearrange
 from dataclasses import dataclass
 
@@ -20,7 +20,7 @@ __all__ = [
 @dataclass
 class hofft_params:
     kern_size: tuple
-    os: float
+    os: Union[float, Sequence[float]]
     L: int
     apods_init: Union[torch.Tensor, str] = 'seg'
     use_type3: bool = False
@@ -33,8 +33,9 @@ class hofft_params:
     ----------
     kern_size : tuple
         Size of the kernel, must have the same number of dimensions as the image.
-    os : Optional[float]
-        Oversampling factor.
+    os : Union[float, Sequence[float]]
+        Oversampling factor. If a float, uses the same oversampling factor for all dimensions.
+        If a sequence, must have the same length as the number of dimensions in the image.
     L : Optional[int]
         Number of apodization functions.
     apods_init : Union[torch.Tensor, str]
@@ -61,7 +62,7 @@ class multi_apod_kern_linop(linop):
                  weights: torch.Tensor,
                  apods: torch.Tensor,
                  dcf: Optional[torch.Tensor] = None,
-                 os_grid: Optional[float] = 1.0,
+                 os_grid: Optional[Union[float, Sequence[float]]] = 1.0,
                  bparams: Optional[batching_params] = batching_params()):
         """
         Initialize the HOFFT linear operator.
@@ -80,10 +81,13 @@ class multi_apod_kern_linop(linop):
             Density compensation function with shape (*trj_size)
         os_grid : Optional[float]
             Oversampling factor for the grid
+            Can also be a sequence of floats for each dimension
         bparams : Optional[batching_params]
             Batching parameters for the linear operator
         """
         im_size = mps.shape[1:]
+        assert all([im_size[i] % 2 == 0 for i in range(len(im_size))]), \
+            f"Image size must be even in all dimensions for HOFFT. im_size: {im_size}"
         trj_size = trj.shape[:-1]
         kern_size = weights.shape[1:-len(trj_size)]
         oshape = (mps.shape[0], *trj_size)
@@ -99,9 +103,16 @@ class multi_apod_kern_linop(linop):
         assert apods.shape[0] == L
         
         # Make sure trajectory is on an oversampled grid
-        assert torch.allclose(trj, (trj * os_grid).round() / os_grid), \
-            f"Trajectory is not on an oversampled grid. os_grid: {os_grid}"
-        
+        if isinstance(os_grid, (int, float)):
+            assert torch.allclose(trj, (trj * os_grid).round() / os_grid), \
+                f"Trajectory is not on an oversampled grid. os_grid: {os_grid}"
+            os_grid = [os_grid] * D
+        else:
+            assert len(os_grid) == D, f"os_grid must have length {D} for {D}-D trajectory."
+            for i in range(D):
+                assert torch.allclose(trj[..., i], (trj[..., i] * os_grid[i]).round() / os_grid[i]), \
+                    f"Trajectory is not on an oversampled grid in dimension {i}. os_grid: {os_grid}"
+            
         # Default dcf
         if dcf is None:
             dcf = torch.ones(trj.shape[:-1], dtype=torch.float32, device=torch_dev)
@@ -114,10 +125,10 @@ class multi_apod_kern_linop(linop):
         else:
             kern_vecs = gen_grd(kern_size, kern_size).reshape((-1, D)).to(torch_dev)
         
-        # Convert to index units
-        im_size_os = [round(im_size[i] * os_grid) for i in range(len(im_size))]
+        im_size_os = [round(im_size[i] * os_grid[i]) for i in range(D)]
         im_size_os_tensor = torch.tensor(im_size_os, device=torch_dev)
-        idx_kerns = (trj * os_grid).round() + im_size_os_tensor // 2
+        os_grid_tensor = torch.tensor(os_grid, device=torch_dev)
+        idx_kerns = (einsum(trj, os_grid_tensor, "... d, d -> ... d")).round() + im_size_os_tensor // 2
         idx_kerns = (idx_kerns[..., None, :] + kern_vecs).type(torch.int32) # (*trj_size, K, d)
         idx_kerns = idx_kerns % im_size_os_tensor.type(torch.int32)
         
