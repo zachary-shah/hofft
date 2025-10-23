@@ -282,7 +282,6 @@ def als_hofft(phis: torch.Tensor,
     verbose = hparams.verbose
     check_convergence = hparams.check_convergence # adds like 15% extra penalty on apod init time
     
-    
     # Make kernel bases
     rs = gen_grd(solve_size).to(torch_dev)
     kern = gen_grd(kern_size, kern_size).to(torch_dev).reshape((-1, d)) 
@@ -334,10 +333,11 @@ def als_hofft(phis: torch.Tensor,
     weights, apods = als_iterations(t3n, kern_bases, apods, max_iter=num_als_iter, check_convergence=check_convergence, verbose=verbose)
 
     # Interpolate spatial funcs
-    kwargs = {'order': 3, 'mode': 'nearest'}
-    solve_size_tensor = torch.tensor(solve_size).to(torch_dev)
-    spatial_crds = (gen_grd(im_size).to(torch_dev) + 0.5) * solve_size_tensor
-    apods = spatial_interp(apods, spatial_crds, **kwargs)
+    if apods.shape[1:] != im_size:
+        kwargs = {'order': 3, 'mode': 'nearest'}
+        solve_size_tensor = torch.tensor(solve_size).to(torch_dev)
+        spatial_crds = (gen_grd(im_size).to(torch_dev) + 0.5) * solve_size_tensor
+        apods = spatial_interp(apods, spatial_crds, **kwargs)
     
     # Reshape weights
     weights = weights.reshape((L, *kern_size, *trj_size))
