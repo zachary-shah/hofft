@@ -242,7 +242,9 @@ def lstsq_spatial(phase_model: linop,
         k_batch_size = K
     if t_batch_size is None:
         t_batch_size = T
+    mask_in = True
     if mask is None:
+        mask_in = False
         mask = torch.ones(im_size, dtype=complex_dtype, device=torch_dev)
     kern_bases *= mask
     
@@ -271,8 +273,17 @@ def lstsq_spatial(phase_model: linop,
         AHA += einsum(kern_cross, cross_terms[:, k1:k2], 'K1 K2 ..., L1 K1 L2 K2 -> ... L1 L2')
         
     # Solve least squares
-    apods = lin_solve(AHA, AHB[..., None], solver=solver, lamda=lamda)[..., 0] # *im_size L
-    apods = rearrange(apods, '... L -> L ...') * mask
+    if mask_in:
+        Nvox = np.prod(im_size)
+        inds = mask.reshape(-1).bool()
+        apods = torch.zeros((Nvox, L), dtype=complex_dtype, device=torch_dev)
+        AHA = AHA.reshape((Nvox, L, L))[inds, :, :]
+        AHB = AHB.reshape((Nvox, L))[inds, :]
+        apods[inds] = lin_solve(AHA, AHB[..., None], solver=solver, lamda=lamda)[..., 0]
+        apods = apods.T.reshape((L, *im_size))
+    else:
+        apods = lin_solve(AHA, AHB[..., None], solver=solver, lamda=lamda)[..., 0] # *im_size L
+        apods = rearrange(apods, '... L -> L ...') * mask
     
     return apods   
     
@@ -322,7 +333,7 @@ def lstsq_temporal(phase_model: linop,
     if mask is None:
         mask = torch.ones(im_size, dtype=complex_dtype, device=torch_dev)
     
-    bases = (kern_bases[None,] * apods[:, None]) * mask
+    bases = (kern_bases[None,] * apods[:, None]) * mask # TODO: only use bases in region defined by mask?
     AHA = torch.zeros((L, K, L, K), dtype=kern_bases.dtype, device=kern_bases.device)
     AHB = torch.zeros((L, K, *trj_size), dtype=kern_bases.dtype, device=kern_bases.device)
     

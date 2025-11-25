@@ -75,6 +75,7 @@ def K_alphas_apod_init(phis: torch.Tensor,
                        num_als_iter: int = 100,
                        check_convergence: bool = True,
                        verbose: bool = True,
+                       mask: Optional[torch.Tensor] = None,
                        K: int = 500,) -> torch.Tensor:
     """
     Initialize apodizations by running ALS on K representative alphas.
@@ -124,7 +125,9 @@ def K_alphas_apod_init(phis: torch.Tensor,
                                                 'K d, ... d -> K ...'))
     
     # Use other apod_init functions to get initial apods
-    if apod_init_method == 'seg':
+    if torch.is_tensor(apod_init_method):
+        apods_init_init = apod_init_method
+    elif apod_init_method == 'seg':
         apods_init_init = alpha_seg_apod_init(phis, alphas, hparams)
     elif apod_init_method == 'eigen':
         apods_init_init = eigen_apod_init(phis, alphas, hparams)
@@ -140,10 +143,11 @@ def K_alphas_apod_init(phis: torch.Tensor,
     if use_type3:
         t3n = type3_nufft(phis, k_alphas, use_toep=True)
     else:
-        t3n = type3_nufft_naive(phis, k_alphas)
+        t3n = type3_nufft_naive(phis, k_alphas, mask=mask)
     
     # ALS agorithm
-    _, apods = als_iterations(t3n, kern_bases, apods_init_init, 
+    _, apods = als_iterations(t3n, kern_bases, apods_init_init,
+                              mask=mask, 
                               max_iter=num_als_iter,
                               check_convergence=check_convergence,
                               verbose=verbose)

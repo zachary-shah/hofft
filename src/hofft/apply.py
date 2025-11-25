@@ -244,6 +244,7 @@ def als_hofft(phis: torch.Tensor,
               alphas: torch.Tensor,
               im_size: tuple,
               hparams: hofft_params,
+              mask: Optional[torch.Tensor] = None,
               num_als_iter: Optional[int] = 100) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Multi-apodization HOFFT model, allowing for arbitrary non-linear phase
@@ -259,6 +260,8 @@ def als_hofft(phis: torch.Tensor,
         Size of the image to be reconstructed.
     hparams : hofft_params
         HOFFT parameters.
+    mask : Optional[torch.Tensor]
+        Spatial mask to restrict voxels used in naive type3 NUFFT.
     num_als_iter : Optional[int]
         Number of ALS iterations.
         
@@ -297,12 +300,17 @@ def als_hofft(phis: torch.Tensor,
     if use_type3:
         t3n = type3_nufft(phis, alphas, use_toep=True)
     else:
-        t3n = type3_nufft_naive(phis, alphas)
+        t3n = type3_nufft_naive(phis, alphas, mask=mask)
 
     # Initialize apodization functions
+    init_init_method = 'seg'
     if isinstance(apods_init, torch.Tensor):
         apods = apods_init
-    elif isinstance(apods_init, str):
+    elif isinstance(apods_init, tuple):
+        # give input of some apods but still run a bit more initialization
+        init_init_method, apods_init = apods_init
+        
+    if isinstance(apods_init, str):
         if 'eig' in apods_init:
             apods = eigen_apod_init(phis, alphas, hparams)
         elif 'seg' in apods_init:
@@ -312,25 +320,27 @@ def als_hofft(phis: torch.Tensor,
             num_iter = int(apods_init.split('_')[-1])
             apods = K_alphas_apod_init(phis, alphas, hparams, 
                                        method='minmax',
-                                       apod_init_method='seg',
+                                       apod_init_method=init_init_method,
                                        check_convergence=check_convergence,
                                        verbose=verbose,
+                                       mask=mask,
                                        num_als_iter=num_iter, K=K)
         elif re.fullmatch(r"\d+_alphas+", apods_init):
             K = int(apods_init.split('_')[0])
             apods = K_alphas_apod_init(phis, alphas, hparams, 
                                        method='minmax',
-                                       apod_init_method='seg',
+                                       apod_init_method=init_init_method,
                                        check_convergence=check_convergence,
                                        verbose=verbose,
+                                       mask=mask,
                                        num_als_iter=100, K=K)
         else:
             raise ValueError(f'Invalid apods_init {apods_init}. Supported methods are seg, eigen, and k_alphas.')
-    else:
+    elif not torch.is_tensor(apods_init):
         raise ValueError("apods_init must be a torch.Tensor or a string")
 
     # ALS to solve for weights and apods
-    weights, apods = als_iterations(t3n, kern_bases, apods, max_iter=num_als_iter, check_convergence=check_convergence, verbose=verbose)
+    weights, apods = als_iterations(t3n, kern_bases, apods, mask=mask, max_iter=num_als_iter, check_convergence=check_convergence, verbose=verbose)
 
     # Interpolate spatial funcs
     if apods.shape[1:] != im_size:
@@ -421,258 +431,3 @@ def mlp_hofft(phis: torch.Tensor,
     
     return weights, apods, kern_model
 
-def coil_hofft(phis: torch.Tensor,
-               alphas: torch.Tensor,
-               mps: torch.Tensor,
-               hparams: hofft_params,
-               num_als_iter: Optional[int] = 100) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Computes HOFFT coefficients when coil sensitivity maps are used.
-    
-    Args
-    ----
-    phis : torch.Tensor
-        Spatial phase maps with shape (B, *solve_size)
-        where solve_size is likely smaller than the image size, but has the same number of dimensions.
-    alphas : torch.Tensor
-        Temporal phase coefficients with shape (B, *trj_size)
-    mps : torch.Tensor
-        Coil sensitivity maps with shape (C, *im_size)
-    hparams : hofft_params
-        HOFFT parameters.
-    num_als_iter : Optional[int]
-        Number of ALS iterations.
-        
-    Returns
-    -------
-    weights : torch.Tensor
-        NUFFT kernel weights with shape (C, C, L, *kern_size, *trj_size)
-    apods : torch.Tensor
-        Apodization functions with shape (L, *im_size)
-    """
-    # Consts
-    im_size = mps.shape[1:]
-    trj_size = alphas.shape[1:]
-    solve_size = phis.shape[1:]
-    torch_dev = phis.device
-    d = len(im_size)
-    kern_size = hparams.kern_size
-    os = hparams.os
-    L = hparams.L
-    apods_init = hparams.apods_init
-    use_type3 = hparams.use_type3
-    verbose = hparams.verbose
-    
-    # Make kernel bases
-    rs = gen_grd(solve_size).to(torch_dev)
-    kern = gen_grd(kern_size, kern_size).to(torch_dev).reshape((-1, d)) / os
-    phz = einsum(kern, rs, 'K D, ... D -> K ...')
-    kern_bases = torch.exp(-2j * np.pi * phz)
-    
-    # Make type3 object
-    if use_type3:
-        t3n = type3_nufft(phis, alphas, use_toep=True)
-    else:
-        t3n = type3_nufft_naive(phis, alphas)
-
-    
-
-def idonttrustthis(phis: torch.Tensor,
-                   alphas: torch.Tensor,
-                   im_size: tuple,
-                   kern_size: tuple,
-                   L: int,
-                   rank : int,
-                   os: Optional[float] = 1.0,
-                   use_type3: Optional[bool] = True,
-                   verbose: Optional[bool] = True,) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Will prob delete this function in exactly 20 minutes.
-    
-    Args:
-    -----
-    phis : torch.Tensor
-        Spatial phase maps with shape (B, *solve_size)
-        where solve_size is likely smaller than the image size, but has the same number of dimensions.
-    alphas : torch.Tensor
-        Temporal phase coefficients with shape (B, *trj_size)
-    im_size : tuple
-        Size of the image to be reconstructed.
-    kern_size : tuple
-        Size of the kernel, must have the same number of dimensions as the image.
-    L : int
-        Number of apodization functions.
-    rank : int
-        Rank of SVD step, needs ot be greater than L * prod(kern_size)
-    os : Optional[float]
-        Oversampling factor.
-    use_type3 : Optional[bool]
-        If True, uses type3 nufft for the forward and adjoint operations.
-    verbose : Optional[bool]
-        If True, prints progress of ALS iterations.
-    
-    Returns:
-    --------
-    weights : torch.Tensor
-        NUFFT kernel weights with shape (L, *kern_size, *trj_size)
-    apods : torch.Tensor
-        Apodization functions with shape (L, *im_size)
-    """
-    # Consts
-    trj_size = alphas.shape[1:]
-    solve_size = phis.shape[1:]
-    torch_dev = phis.device
-    d = len(im_size)
-    B = phis.shape[0]
-    K = np.prod(kern_size)
-    assert rank >= L * K, "Rank must be greater than L * prod(kern_size)"
-    
-    # Make kernel bases
-    rs = gen_grd(solve_size).to(torch_dev)
-    kern = gen_grd(kern_size, kern_size).to(torch_dev).reshape((-1, d)) / os
-    phz = einsum(kern, rs, 'K D, ... D -> K ...')
-    kern_bases = torch.exp(-2j * np.pi * phz)
-    
-    # Spatial eigen-vectors
-    if use_type3:
-        t3n = type3_nufft(phis, alphas, use_toep=True)
-    else:
-        t3n = type3_nufft_naive(phis, alphas)
-    x0 = torch.randn(solve_size, dtype=complex_dtype, device=torch_dev)
-    spatial_vecs, _ = eigen_decomp_operator(t3n.normal, x0, num_eigen=rank, verbose=verbose,
-                                            num_iter=100)
-    
-    # Solve for kernel coefficiets for each spatial vector
-    E = kern_bases.reshape((K, -1)).T # R K
-    B = spatial_vecs.reshape((rank, -1)).T # R r
-    EHE = E.H @ E # K K
-    EHB = E.H @ B # K r
-    coeffs = lin_solve(EHE, EHB, lamda=0.0, solver='solve') # K r
-    
-    # Cluster coefficients into L groups
-    coeffs_reim = torch.cat([coeffs.real, coeffs.imag], dim=0)
-    cents, idxs = quantize_data(coeffs_reim.T, L, method='cluster')
-    cents = cents[:, :K] + 1j * cents[:, K:]
-    
-    # For each cluster, solve for apodization functions
-    apods = []
-    for i in range(L):
-        
-        print((idxs == i).sum(), f'l = {i+1}')
-        
-        # Grab data for this group
-        inds_i = torch.argwhere(idxs == i)[:, 0] # g
-        vi = B[:, inds_i] # R g
-        ci = coeffs[:, inds_i] # K g
-        
-        # Solve least squares diagonal form
-        Eci = E @ ci # R g
-        Eci_vi = (Eci.conj() * vi).sum(dim=-1) # R
-        Eci_Eci = (Eci.conj() * Eci).sum(dim=-1) # R
-        apods.append(Eci_vi / (Eci_Eci + 1e-3))
-    apods = torch.stack(apods, dim=0).reshape((L, *solve_size))
-    
-    # Run a temporal least squares, and done.
-    weights = lstsq_temporal(t3n, kern_bases, apods)
-    weights = weights.reshape((L, *kern_size, *trj_size))
-    
-    # Interpolate spatial funcs
-    kwargs = {'order': 3, 'mode': 'nearest'}
-    solve_size_tensor = torch.tensor(solve_size).to(torch_dev)
-    spatial_crds = (gen_grd(im_size).to(torch_dev) + 0.5) * solve_size_tensor
-    apods = spatial_interp(apods, spatial_crds, **kwargs)
-    
-    return weights, apods
-    
-def also_this_one(phis: torch.Tensor,
-                  alphas: torch.Tensor,
-                  im_size: tuple,
-                  kern_size: tuple,
-                  L: int,
-                  rank : int,
-                  os: Optional[float] = 1.0,
-                  use_type3: Optional[bool] = True,
-                  verbose: Optional[bool] = True,) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    I also don't trust this, but at least this one is not a chatGPT idea.
-    
-    Args:
-    -----
-    phis : torch.Tensor
-        Spatial phase maps with shape (B, *solve_size)
-        where solve_size is likely smaller than the image size, but has the same number of dimensions.
-    alphas : torch.Tensor
-        Temporal phase coefficients with shape (B, *trj_size)
-    im_size : tuple
-        Size of the image to be reconstructed.
-    kern_size : tuple
-        Size of the kernel, must have the same number of dimensions as the image.
-    L : int
-        Number of apodization functions.
-    rank : int
-        Rank of SVD step, needs ot be greater than L * prod(kern_size)
-    os : Optional[float]
-        Oversampling factor.
-    use_type3 : Optional[bool]
-        If True, uses type3 nufft for the forward and adjoint operations.
-    verbose : Optional[bool]
-        If True, prints progress of ALS iterations.
-    
-    Returns:
-    --------
-    weights : torch.Tensor
-        NUFFT kernel weights with shape (L, *kern_size, *trj_size)
-    apods : torch.Tensor
-        Apodization functions with shape (L, *im_size)
-    """
-    # Consts
-    trj_size = alphas.shape[1:]
-    solve_size = phis.shape[1:]
-    torch_dev = phis.device
-    d = len(im_size)
-    B = phis.shape[0]
-    K = np.prod(kern_size)
-    assert rank >= L * K, "Rank must be greater than L * prod(kern_size)"
-    
-    # Make kernel bases
-    rs = gen_grd(solve_size).to(torch_dev)
-    kern = gen_grd(kern_size, kern_size).to(torch_dev).reshape((-1, d)) / os
-    phz = einsum(kern, rs, 'K D, ... D -> K ...')
-    kern_bases = torch.exp(-2j * np.pi * phz)
-    
-    # Spatial eigen-vectors
-    if use_type3:
-        t3n = type3_nufft(phis, alphas, use_toep=True)
-    else:
-        t3n = type3_nufft_naive(phis, alphas)
-    x0 = torch.randn(solve_size, dtype=complex_dtype, device=torch_dev)
-    # apods, _ = eigen_decomp_operator(t3n.normal, x0, num_eigen=L, verbose=verbose,
-    #                                  num_iter=100)
-    spatial_vecs, _ = eigen_decomp_operator(t3n.normal, x0, num_eigen=rank, verbose=verbose,
-                                            num_iter=100)
-    
-    # Define linop 
-    def sym_op(x):
-        # x has shape L *solve_size
-        xk = einsum(x, kern_bases, 'L ..., K ... -> L K ...')
-        xk_proj = einsum(xk, spatial_vecs.conj(), 'L K ..., r ... -> L K r')
-        xk_back = einsum(xk_proj, spatial_vecs, 'L K r, r ... -> L K ...')
-        x_back = einsum(xk_back, kern_bases.conj(), 'L K ..., K ... -> L ...')
-        return K * x - x_back
-    
-    apods, evals = eigen_decomp_operator(sym_op, x0, num_eigen=L, verbose=verbose,
-                                       num_iter=100, largest=False)
-    
-    # Run a temporal least squares, and done.
-    weights = lstsq_temporal(t3n, kern_bases, apods)
-    weights = weights.reshape((L, *kern_size, *trj_size))
-    
-    # Interpolate spatial funcs
-    kwargs = {'order': 3, 'mode': 'nearest'}
-    solve_size_tensor = torch.tensor(solve_size).to(torch_dev)
-    spatial_crds = (gen_grd(im_size).to(torch_dev) + 0.5) * solve_size_tensor
-    apods = spatial_interp(apods, spatial_crds, **kwargs)
-    
-    return weights, apods
-    
-    
