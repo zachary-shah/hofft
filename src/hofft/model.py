@@ -1,18 +1,20 @@
 import torch
 import numpy as np
+import warnings
 
 from mr_recon.linops import linop, batching_params
 from mr_recon.indexing import ravel
-from mr_recon.utils import gen_grd, batch_iterator, resize
+from mr_recon.utils import gen_grd, batch_iterator
 from mr_recon.fourier import fft, ifft
 from mr_recon.indexing import multi_index, multi_grid
 from mr_recon.algs import power_method_operator
 from mr_recon.pad import PadLast
-from .kb import _gen_kern_vectors
 
 from typing import Optional, Union, Sequence, Tuple
-from einops import einsum, rearrange
-from dataclasses import dataclass
+from einops import einsum
+from dataclasses import dataclass, field
+
+from .matvec import matvec, matvec_naive, matvec_type3
 
 __all__ = [
     'multi_apod_kern_linop', 
@@ -28,7 +30,9 @@ class hofft_params:
     os: Union[float, Sequence[float]]
     L: int
     apods_init: Union[torch.Tensor, str] = 'seg'
-    use_type3: bool = False
+    matvec_type: matvec = matvec_naive
+    matvec_kwargs: dict = field(default_factory=dict)
+    use_type3: Optional[bool] = None
     verbose: bool = True
     check_convergence: bool = True
     """
@@ -50,11 +54,19 @@ class hofft_params:
         'k_alphas' - uses K representative alphas to initialize apodization functions
         If torch.Tensor:
         Initial apodization functions with shape (L, *solve_size)
-    use_type3 : Optional[bool]
+    use_type3 : Optional[bool]. Deprecated.
         If True, uses type3 nufft for the forward and adjoint operations.
     verbose : Optional[bool]
         If True, prints progress
     """
+    def __post_init__(self):
+        if self.use_type3 is not None:
+            tystr = "matvec_type3" if self.use_type3 else "matvec_naive"
+            warnings.warn(
+                f"hofft_params.use_type3 is deprecated; use `matvec_type` with `matvec_kwargs` instead. Using {tystr}.", 
+                DeprecationWarning,
+            )
+            self.matvec_type = matvec_type3 if self.use_type3 else matvec_naive
 
 class multi_apod_kern_linop(linop):
     """
@@ -600,7 +612,6 @@ class multi_apod_kern_linop_batch(linop):
         """
         
         return self.adjoint(self.forward(img))
-
 
 
 class multi_apod_kern_linop_multishot(linop):

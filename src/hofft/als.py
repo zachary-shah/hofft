@@ -19,6 +19,7 @@ This object performs the following two important operations:
 
 import torch
 import numpy as np
+from warnings import warn
 
 from typing import Optional
 from einops import rearrange, einsum
@@ -26,8 +27,9 @@ from tqdm import tqdm
 
 from mr_recon.algs import eigen_decomp_operator, lin_solve
 from mr_recon.utils import quantize_data
-from mr_recon.linops import linop
 from mr_recon.dtypes import complex_dtype
+
+from .matvec import matvec
 
 __all__ = [
     'als_iterations', 
@@ -38,7 +40,7 @@ __all__ = [
 # TODO:
 # - masking doesn't work well
 
-def init_apods(phase_model: linop,
+def init_apods(phase_model: matvec,
                L: int,
                method: Optional[str] = 'rnd',
                torch_dev: Optional[torch.device] = torch.device('cpu')) -> torch.Tensor:
@@ -47,7 +49,7 @@ def init_apods(phase_model: linop,
     
     Args:
     -----
-    phase_model : mr_recon.linop
+    phase_model : hofft.matvec.matvec
         linear operator for the phase operator
     L : int
         number of apodization functions
@@ -87,7 +89,7 @@ def init_apods(phase_model: linop,
         phis = phase_model.phis
         B = alphas.shape[0]
         alphas = alphas.reshape((B, -1))
-        print(f'Warning: Segmentation with fast type3nufft might not work too well ...')
+        warn(f'Warning: Segmentation with fast type3nufft might not work too well ...')
         if B == 1:
             clusts, _ = quantize_data(alphas.T, L, method='uniform')
         else:
@@ -98,7 +100,7 @@ def init_apods(phase_model: linop,
     
     return apods
 
-def als_iterations(phase_model: linop, 
+def als_iterations(phase_model: matvec, 
                    kern_bases: torch.Tensor,
                    apods_init: torch.Tensor,
                    mask: Optional[torch.Tensor] = None,
@@ -190,7 +192,7 @@ def als_iterations(phase_model: linop,
 
     return weights, apods
     
-def lstsq_spatial(phase_model: linop, 
+def lstsq_spatial(phase_model: matvec, 
                   kern_bases: torch.Tensor, 
                   weights: torch.Tensor,
                   mask: Optional[torch.Tensor] = None,
@@ -204,7 +206,7 @@ def lstsq_spatial(phase_model: linop,
     
     Args
     ----
-    phase_model : mr_recon.linops.linop
+    phase_model : hofft.matvec.matvec
         linear operator for the phase operator
     kern_bases : torch.Tensor
         kernel bases with shape (K, *im_size)
@@ -287,7 +289,7 @@ def lstsq_spatial(phase_model: linop,
     
     return apods   
     
-def lstsq_temporal(phase_model: linop, 
+def lstsq_temporal(phase_model: matvec, 
                    kern_bases: torch.Tensor, 
                    apods: torch.Tensor, 
                    mask: Optional[torch.Tensor] = None,
@@ -299,7 +301,7 @@ def lstsq_temporal(phase_model: linop,
     
     Args
     ----
-    phase_model : mr_recon.linops.linop
+    phase_model : hofft.matvec.matvec
         linear operator for the phase operator
     kern_bases : torch.Tensor
         kernel bases with shape (K, *im_size)

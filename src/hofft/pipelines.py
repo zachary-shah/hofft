@@ -6,7 +6,6 @@ from mr_recon.imperfections.field import b0_to_phis_alphas
 from mr_recon.utils import gen_grd
 from mr_recon.linops import linop, batching_params
 from hofft.model import hofft_params, multi_apod_kern_linop
-from hofft.apply import als_hofft
 
 def b0_correction(b0: torch.Tensor,
                   trj: torch.Tensor,

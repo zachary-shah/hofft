@@ -6,7 +6,6 @@ from einops import einsum
 from mr_recon.utils import gen_grd, quantize_data
 from mr_recon.algs import eigen_decomp_operator
 from mr_recon.imperfections.field import alpha_segementation
-from mr_recon.linops import type3_nufft_naive, type3_nufft
 from mr_recon.dtypes import complex_dtype
 
 from hofft.als import als_iterations
@@ -107,9 +106,10 @@ def K_alphas_apod_init(phis: torch.Tensor,
     torch_dev = phis.device
     B = phis.shape[0]
     d = len(im_size)
-    use_type3 = hparams.use_type3
     kern_size = hparams.kern_size
     os = hparams.os
+    matvec_type = hparams.matvec_type
+    matvec_kwargs = hparams.matvec_kwargs or dict()
     
     # Prep ALS algorithm
     rs = gen_grd(im_size).to(torch_dev)
@@ -130,7 +130,7 @@ def K_alphas_apod_init(phis: torch.Tensor,
     elif apod_init_method == 'seg':
         apods_init_init = alpha_seg_apod_init(phis, alphas, hparams)
     elif apod_init_method == 'eigen':
-        apods_init_init = eigen_apod_init(phis, alphas, hparams)
+        apods_init_init = eigen_apod_init(phis, alphas, hparams, mask=mask)
     else:
         raise ValueError(f'Invalid apod_init_method {apod_init_method}. Supported methods are seg and eigen.')
     
@@ -139,14 +139,13 @@ def K_alphas_apod_init(phis: torch.Tensor,
                                  sigma=0, method=method)
     k_alphas = k_alphas.T # shape (B, K)
     
-    # Make type3 object using k_alphas
-    if use_type3:
-        t3n = type3_nufft(phis, k_alphas, use_toep=True)
-    else:
-        t3n = type3_nufft_naive(phis, k_alphas, mask=mask)
+    # Matvec object
+    mvobj = matvec_type(
+        phis, k_alphas, mask=mask, **matvec_kwargs,
+    )
     
     # ALS agorithm
-    _, apods = als_iterations(t3n, kern_bases, apods_init_init,
+    _, apods = als_iterations(mvobj, kern_bases, apods_init_init,
                               mask=mask, 
                               max_iter=num_als_iter,
                               check_convergence=check_convergence,
@@ -155,8 +154,9 @@ def K_alphas_apod_init(phis: torch.Tensor,
     return apods
     
 def alpha_seg_apod_init(phis: torch.Tensor,
-                         alphas: torch.Tensor,
-                         hparams: hofft_params) -> torch.Tensor:
+                        alphas: torch.Tensor,
+                        hparams: hofft_params,
+                        mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Initialize apodizations using alpha segmentation.
     
@@ -175,12 +175,13 @@ def alpha_seg_apod_init(phis: torch.Tensor,
         initialized apodizations, shape (L, *im_size).
     """
     L = hparams.L
-    apods, _ = alpha_segementation(phis, alphas, L=L, L_batch_size=L, interp_type='zero', use_type3=False)
+    apods, _ = alpha_segementation(phis, alphas, L=L, L_batch_size=L, interp_type='zero', use_type3=False, mask=mask)
     return apods
 
 def eigen_apod_init(phis: torch.Tensor,
-                     alphas: torch.Tensor,
-                     hparams: hofft_params) -> torch.Tensor:
+                    alphas: torch.Tensor,
+                    hparams: hofft_params,
+                    mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Initialize apodizations using eigen-decomposition of the system matrix.
     
@@ -200,17 +201,17 @@ def eigen_apod_init(phis: torch.Tensor,
     im_size = phis.shape[1:]
     torch_dev = phis.device
     L = hparams.L
-    use_type3 = hparams.use_type3
+    matvec_type = hparams.matvec_type
+    matvec_kwargs = hparams.matvec_kwargs or dict()
     
-    # Make type3 object
-    if use_type3:
-        t3n = type3_nufft(phis, alphas, use_toep=True)
-    else:
-        t3n = type3_nufft_naive(phis, alphas)
+    # Matvec object
+    mvobj = matvec_type(
+        phis, alphas, mask=mask, **matvec_kwargs,
+    )
     
     # Eigen-decomp
     x0 = torch.randn(im_size, dtype=complex_dtype, device=torch_dev)
-    apods, _ = eigen_decomp_operator(t3n.normal, x0, num_eigen=L, 
+    apods, _ = eigen_decomp_operator(mvobj.normal, x0, num_eigen=L, 
                                      num_iter=15,
                                      lobpcg=True,
                                      largest=True)

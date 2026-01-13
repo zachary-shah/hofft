@@ -2,23 +2,22 @@ import re
 import torch
 import numpy as np
 
-from typing import Optional, Union
-from einops import einsum, rearrange
-from dataclasses import dataclass
+from typing import Optional
+from einops import einsum
 
-from mr_recon.utils import gen_grd, resize, quantize_data
+from mr_recon.utils import gen_grd, resize
 from mr_recon.spatial import spatial_interp
-from mr_recon.algs import eigen_decomp_operator, lin_solve
+from mr_recon.algs import eigen_decomp_operator
 from mr_recon.imperfections.field import alpha_segementation
-from mr_recon.fourier import fft, ifft, sigpy_nufft, matrix_nufft, torchkb_nufft
-from mr_recon.linops import linop, type3_nufft_naive, type3_nufft
+from mr_recon.fourier import fft, ifft, sigpy_nufft
+from mr_recon.linops import linop
 from mr_recon.dtypes import complex_dtype
 
-from hofft.apod_init import K_alphas_apod_init, alpha_seg_apod_init, eigen_apod_init
-from hofft.als import als_iterations, lstsq_temporal
-from hofft.sgd import train_net_apod
-from hofft.kb import kb_weights_1d, kb_apod_1d, sample_kb_kernel, _gen_kern_bases
-from hofft.model import hofft_params
+from .apod_init import K_alphas_apod_init, alpha_seg_apod_init, eigen_apod_init
+from .als import als_iterations
+from .sgd import train_net_apod
+from .kb import kb_apod_1d, sample_kb_kernel
+from .model import hofft_params
 
 __all__ = [
     'funcs_to_phase',
@@ -222,8 +221,6 @@ def als_nufft(trj: torch.Tensor,
         def adjoint(self, y):
             return high_acc_nufft.adjoint(y[None,], kdevs_rs[None,])[0]
     t3n = phase_model()
-    # t3n = type3_nufft_naive(rs.moveaxis(-1, 0), kdevs.moveaxis(-1, 0))
-    # t3n = type3_nufft(rs.moveaxis(-1, 0), kdevs.moveaxis(-1, 0))
     weights, apods = als_iterations(t3n, kern_bases, apods, max_iter=num_als_iter, verbose=verbose)
 
     # Interpolate spatial funcs
@@ -261,7 +258,7 @@ def als_hofft(phis: torch.Tensor,
     hparams : hofft_params
         HOFFT parameters.
     mask : Optional[torch.Tensor]
-        Spatial mask to restrict voxels used in naive type3 NUFFT.
+        Spatial mask to restrict voxels used in matvec.
     num_als_iter : Optional[int]
         Number of ALS iterations.
         
@@ -281,10 +278,11 @@ def als_hofft(phis: torch.Tensor,
     os = hparams.os
     L = hparams.L
     apods_init = hparams.apods_init
-    use_type3 = hparams.use_type3
     verbose = hparams.verbose
     check_convergence = hparams.check_convergence # adds like 15% extra penalty on apod init time
-    
+    matvec_type = hparams.matvec_type
+    matvec_kwargs = hparams.matvec_kwargs or dict()
+
     # Make kernel bases
     rs = gen_grd(solve_size).to(torch_dev)
     kern = gen_grd(kern_size, kern_size).to(torch_dev).reshape((-1, d)) 
@@ -296,11 +294,10 @@ def als_hofft(phis: torch.Tensor,
     phz = einsum(kern, rs, 'K D, ... D -> K ...')
     kern_bases = torch.exp(-2j * np.pi * phz)
     
-    # Make type3 object
-    if use_type3:
-        t3n = type3_nufft(phis, alphas, use_toep=True)
-    else:
-        t3n = type3_nufft_naive(phis, alphas, mask=mask)
+    # Matvec object
+    mvobj = matvec_type(
+        phis, alphas, mask=mask, **matvec_kwargs,
+    )
 
     # Initialize apodization functions
     init_init_method = 'seg'
@@ -312,9 +309,9 @@ def als_hofft(phis: torch.Tensor,
         
     if isinstance(apods_init, str):
         if 'eig' in apods_init:
-            apods = eigen_apod_init(phis, alphas, hparams)
+            apods = eigen_apod_init(phis, alphas, hparams, mask=mask)
         elif 'seg' in apods_init:
-            apods = alpha_seg_apod_init(phis, alphas, hparams)
+            apods = alpha_seg_apod_init(phis, alphas, hparams, mask=mask)
         elif re.fullmatch(r"\d+_alphas_\d+", apods_init):
             K = int(apods_init.split('_')[0])
             num_iter = int(apods_init.split('_')[-1])
@@ -340,7 +337,7 @@ def als_hofft(phis: torch.Tensor,
         raise ValueError("apods_init must be a torch.Tensor or a string")
 
     # ALS to solve for weights and apods
-    weights, apods = als_iterations(t3n, kern_bases, apods, mask=mask, max_iter=num_als_iter, check_convergence=check_convergence, verbose=verbose)
+    weights, apods = als_iterations(mvobj, kern_bases, apods, mask=mask, max_iter=num_als_iter, check_convergence=check_convergence, verbose=verbose)
 
     # Interpolate spatial funcs
     if apods.shape[1:] != im_size:
@@ -358,6 +355,7 @@ def mlp_hofft(phis: torch.Tensor,
               alphas: torch.Tensor,
               im_size: tuple,
               hparams: hofft_params,
+              mask: Optional[torch.Tensor] = None,
               opt_apods: bool = True,
               epochs: int = 100) -> tuple[torch.Tensor, torch.Tensor, torch.nn.Module]:
     """
@@ -398,7 +396,6 @@ def mlp_hofft(phis: torch.Tensor,
     os = hparams.os
     L = hparams.L
     apods_init = hparams.apods_init
-    use_type3 = hparams.use_type3
     verbose = hparams.verbose
     
     # Initialize apodization functions
@@ -406,12 +403,13 @@ def mlp_hofft(phis: torch.Tensor,
         apods = apods_init
     elif isinstance(apods_init, str):
         if apods_init == 'eigen':
-            apods = eigen_apod_init(phis, alphas, hparams)
+            apods = eigen_apod_init(phis, alphas, hparams, mask=mask)
         elif apods_init == 'seg':
-            apods = alpha_seg_apod_init(phis, alphas, hparams)
+            apods = alpha_seg_apod_init(phis, alphas, hparams, mask=mask)
         elif re.fullmatch(r"\d+_alphas", apods_init):
             K = int(apods_init.split('_')[0])
             apods = K_alphas_apod_init(phis, alphas, hparams,
+                                       mask=mask,
                                        method='minmax',
                                        apod_init_method='seg',
                                        num_als_iter=100, K=K)
