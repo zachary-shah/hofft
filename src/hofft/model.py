@@ -35,6 +35,10 @@ class hofft_params:
     use_type3: Optional[bool] = None
     verbose: bool = True
     check_convergence: bool = True
+
+    # resizing phis
+    rs_max_phis_N: Optional[int] = None
+    rs_order: int = 3
     """
     Parameters for HOFFT models.
     
@@ -1148,6 +1152,8 @@ class multi_apod_kern_linop_loop(linop):
                  weights: torch.Tensor,
                  apods: torch.Tensor,
                  dcf: Optional[torch.Tensor] = None,
+                 noise_cov: Optional[torch.Tensor] = None,
+                 inv_nc_lr: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                  os_grid: Optional[Union[float, Sequence[float]]] = 1.0,
                  bparams: Optional[batching_params] = batching_params()):
         """
@@ -1165,6 +1171,10 @@ class multi_apod_kern_linop_loop(linop):
             the apodization functions with shape (N, L, *im_size)
         dcf : Optional[torch.Tensor]
             Density compensation function with shape (N, *trj_size)
+        noise_cov : Optional[torch.Tensor]
+            Noise covariance matrix with shape (N, *trj_size, C, C)
+        inv_nc_lr : Optional[Tuple[torch.Tensor, torch.Tensor]]
+            Inverse noise covariance in a low-rank approximation of size (N, *trj_size, L) and (N, L, nc, nc)
         os_grid : Optional[float]
             Oversampling factor for the grid
             Can also be a sequence of floats for each dimension
@@ -1220,6 +1230,9 @@ class multi_apod_kern_linop_loop(linop):
         idx_kerns = (einsum(trj, os_grid_tensor, "... d, d -> ... d")).round()
         idx_kerns = (idx_kerns[..., None, :] + kern_vecs).type(torch.int32) # (N, *trj_size, K, d)
         idx_kerns = idx_kerns % im_size_os_tensor.type(torch.int32)
+
+        # Set noise covariance
+        self.set_noise_cov(noise_cov, inv_nc_lr)
         
         # Store params
         self.padder = PadLast(im_size_os, list(im_size))
@@ -1251,6 +1264,76 @@ class multi_apod_kern_linop_loop(linop):
         self.C = mps.shape[0]
         self.L = L
         self.K = self.weights.shape[-1]
+
+    def set_noise_cov(self, noise_cov, inv_nc_lr):
+        """
+        Either compute inverse noise cov, or set from low-rank factors.
+        """
+        self.noisecovmode = None
+        self.inv_noise_cov = None
+        self.inc_temporal = None
+        self.inc_spatial = None
+        if inv_nc_lr is not None:
+            assert noise_cov is None, "Only supply noise_cov or inc_nc_lr, not both."
+            # dont pre-compute for memory purposes
+            self.inc_temporal = inv_nc_lr[0]
+            self.inc_spatial = inv_nc_lr[1]
+            self.noisecovmode = "lr"
+        elif noise_cov is not None:
+            self.inv_noise_cov = torch.zeros_like(noise_cov)
+            for i in range(noise_cov.shape[0]):
+                self.inv_noise_cov[i] = torch.linalg.inv(noise_cov[i])
+            self.noisecovmode = "full"
+            
+    def apply_kspace_coil_mat(self,
+                              ksp: torch.Tensor,
+                              n1: int, n2: int) -> torch.Tensor:
+        """
+        Applies a coil matrix to each point in kspace
+
+        currently copied from sense_img_batch.py, need to improve later.
+        
+        Parameters
+        ----------
+        ksp : torch.tensor
+            the k-space data with shape (N, C, *trj_size)
+        n1: int
+            start index along N
+        n2 : int
+            end along N
+        
+        Returns
+        ---------
+        ksp_new : torch.tensor
+            the k-space data with shape (N, C, *trj_size) after applying the coil matrix
+        """
+        if self.noisecovmode is None:
+            return ksp
+
+        nslc = slice(n1, n2)
+
+        ksp_new = torch.zeros_like(ksp)
+        C = ksp.shape[1]
+        first_coil_batch = C
+
+        assert self.noisecovmode in ["full", "lr"], "noise cov mode not set properly."
+        
+        for c1, c2 in batch_iterator(C, first_coil_batch):
+            second_coil_batch = C
+            for d1, d2 in batch_iterator(C, second_coil_batch):
+                if self.noisecovmode == "full":
+                    # pre-computed
+                    kmat_batch = self.inv_noise_cov[nslc, ..., c1:c2, d1:d2]
+                else:
+                    # mem efficient version
+                    kmat_batch = einsum(
+                        self.inc_temporal[nslc], 
+                        self.inc_spatial[nslc, ..., c1:c2, d1:d2],
+                        "N ... L, N L c1 c2 -> N ... c1 c2"
+                    )
+                ksp_new[:, c1:c2] = einsum(ksp[:, d1:d2], kmat_batch, 'N ci ..., N ... co ci -> N co ...')
+
+        return ksp_new  
 
 
     def forward(self,
@@ -1344,6 +1427,10 @@ class multi_apod_kern_linop_loop(linop):
         for n1, n2 in batch_iterator(N, ibs):
             batch = n2 - n1
             idx_batch = self.idx_ravel[n1:n2].reshape(batch, 1, 1, -1)
+
+            # apply noise covariacnes
+            ksp[n1:n2] = self.apply_kspace_coil_mat(ksp[n1:n2], n1, n2)
+
             for c1, c2 in batch_iterator(C, cbs):
                 cbatch = c2 - c1
 
@@ -1412,6 +1499,10 @@ class multi_apod_kern_linop_loop(linop):
             # Apply kernels
             ksp = einsum(blocks_flat.reshape(batch, C, L, *rav_shape), self.weights[n1:n2], 'N C L ... K, N L ... K -> N C ...')
             ksp = ksp * self.dcf[n1:n2, None,]
+
+            # apply noise covariances
+            ksp = self.apply_kspace_coil_mat(ksp, n1, n2)
+
             Kyf = einsum(ksp, self.weights[n1:n2].conj(), 'N C ..., N L ... K -> N C L ... K').reshape(batch, C, L, -1)
 
             # Gridding

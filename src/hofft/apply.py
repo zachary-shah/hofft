@@ -6,7 +6,7 @@ from typing import Optional
 from einops import einsum
 
 from mr_recon.utils import gen_grd, resize
-from mr_recon.spatial import spatial_interp
+from mr_recon.spatial import spatial_interp, spatial_resize_poly
 from mr_recon.algs import eigen_decomp_operator
 from mr_recon.imperfections.field import alpha_segementation
 from mr_recon.fourier import fft, ifft, sigpy_nufft
@@ -269,6 +269,17 @@ def als_hofft(phis: torch.Tensor,
     apods : torch.Tensor
         Apodization functions with shape (L, *im_size)
     """
+
+    # resize phis
+    im_size_raw = im_size
+    if hparams.rs_max_phis_N is not None:
+        phis_size = tuple([min(im_size[d], hparams.rs_max_phis_N) for d in range(len(im_size))])
+        print(f"Resizing phis from {im_size} to {phis_size}")
+        phis = spatial_resize_poly(phis, phis_size, order=hparams.rs_order)
+        mask = spatial_resize_poly(mask, phis_size, order=1).bool()
+        phis = phis * mask[None,]
+        im_size = phis_size
+
     # Consts
     trj_size = alphas.shape[1:]
     solve_size = phis.shape[1:]
@@ -345,6 +356,9 @@ def als_hofft(phis: torch.Tensor,
         solve_size_tensor = torch.tensor(solve_size).to(torch_dev)
         spatial_crds = (gen_grd(im_size).to(torch_dev) + 0.5) * solve_size_tensor
         apods = spatial_interp(apods, spatial_crds, **kwargs)
+
+    if im_size != im_size_raw:
+        apods = spatial_resize_poly(apods, im_size_raw, order=hparams.rs_order)
     
     # Reshape weights
     weights = weights.reshape((L, *kern_size, *trj_size))
