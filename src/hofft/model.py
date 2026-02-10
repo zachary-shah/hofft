@@ -1311,29 +1311,24 @@ class multi_apod_kern_linop_loop(linop):
             return ksp
 
         nslc = slice(n1, n2)
-
-        ksp_new = torch.zeros_like(ksp)
         C = ksp.shape[1]
-        first_coil_batch = C
 
         assert self.noisecovmode in ["full", "lr"], "noise cov mode not set properly."
         
-        for c1, c2 in batch_iterator(C, first_coil_batch):
-            second_coil_batch = C
-            for d1, d2 in batch_iterator(C, second_coil_batch):
-                if self.noisecovmode == "full":
-                    # pre-computed
-                    kmat_batch = self.inv_noise_cov[nslc, ..., c1:c2, d1:d2]
-                else:
-                    # mem efficient version
-                    kmat_batch = einsum(
-                        self.inc_temporal[nslc], 
-                        self.inc_spatial[nslc, ..., c1:c2, d1:d2],
-                        "N ... L, N L c1 c2 -> N ... c1 c2"
-                    )
-                ksp_new[:, c1:c2] = einsum(ksp[:, d1:d2], kmat_batch, 'N ci ..., N ... co ci -> N co ...')
+        if self.noisecovmode == "full":
+            ksp = (
+                self.inv_noise_cov[nslc] @ ksp.moveaxis(1, -1).unsqueeze(-1)
+            ).squeeze(-1).moveaxis(-1, 1)
+        else:
+            # mem efficient version
+            kmat_batch = einsum(
+                self.inc_temporal[nslc], 
+                self.inc_spatial[nslc],
+                "N ... L, N L c1 c2 -> N ... c1 c2"
+            )
+            ksp = einsum(ksp, kmat_batch, 'N ci ..., N ... co ci -> N co ...')
 
-        return ksp_new  
+        return ksp  
 
 
     def forward(self,
@@ -1485,8 +1480,8 @@ class multi_apod_kern_linop_loop(linop):
             idx_batch = self.idx_ravel[n1:n2].reshape(batch, 1, 1, -1)
 
             # mps / apods
-            Sx = img[n1:n2, None] * self.mps[None, :, :] # N, C, *im_size
-            MSx = Sx[:, :, None] * self.apods[n1:n2, None, :] # N, C, L, *im_size
+            Sx = img[n1:n2].unsqueeze(1) * self.mps.unsqueeze(0) # N, C, *im_size
+            MSx = Sx.unsqueeze(2) * self.apods[n1:n2].unsqueeze(1)# N, C, L, *im_size
 
             # Oversampled FFT
             MSx = self.padder(MSx)
@@ -1496,14 +1491,20 @@ class multi_apod_kern_linop_loop(linop):
             FMSx_flat = FMSx.reshape(batch, C, L, -1)
             blocks_flat = torch.gather(FMSx_flat, -1, idx_batch.expand(-1, C, L, -1))
 
-            # Apply kernels
-            ksp = einsum(blocks_flat.reshape(batch, C, L, *rav_shape), self.weights[n1:n2], 'N C L ... K, N L ... K -> N C ...')
+            # sum over segments and kernels
+            ksp = torch.sum(
+                blocks_flat.reshape(batch, C, L, *rav_shape) * self.weights[n1:n2].unsqueeze(1),
+                dim = (2, -1),
+            ) # (N, C, ...)
             ksp = ksp * self.dcf[n1:n2, None,]
 
             # apply noise covariances
             ksp = self.apply_kspace_coil_mat(ksp, n1, n2)
 
-            Kyf = einsum(ksp, self.weights[n1:n2].conj(), 'N C ..., N L ... K -> N C L ... K').reshape(batch, C, L, -1)
+            # expand back to kernels
+            Kyf = (
+                ksp.unsqueeze(2).unsqueeze(-1) * self.weights[n1:n2].conj().unsqueeze(1)
+            ).reshape(batch, C, L, -1) # (N, C, L, (... * K))
 
             # Gridding
             Kygrid_view = Kygrid[:batch]
@@ -1516,8 +1517,8 @@ class multi_apod_kern_linop_loop(linop):
             FKy = self.padder.adjoint(FKy) # (N, C, L, *im_size)
 
             # Apply adjoint mps and apods to image (in place)
-            MFKy = (self.apods.conj()[n1:n2, None] * FKy).sum(dim=2) # (N, C, *im_size)
-            out[n1:n2] = (self.mps.conj()[None] * MFKy).sum(dim=1) # (N, *im_size)
+            MFKy = (self.apods.conj()[n1:n2].unsqueeze(1) * FKy).sum(dim=2) # (N, C, *im_size)
+            out[n1:n2] = (self.mps.conj().unsqueeze(0) * MFKy).sum(dim=1) # (N, *im_size)
 
         return out
     
