@@ -1529,3 +1529,72 @@ class multi_apod_kern_linop_loop(linop):
         """
         x0 = torch.randn((N, *self.im_size), device=self.mps.device, dtype=self.mps.dtype)
         return power_method_operator(self.normal, x0, verbose=verbose, num_iter=15)[1] * 1.05
+
+
+class multi_apod_kern_linop_nobatch(linop):
+    def __init__(self, 
+                 trj: torch.Tensor,
+                 mps: torch.Tensor,
+                 weights: torch.Tensor,
+                 apods: torch.Tensor,
+                 dcf: Optional[torch.Tensor] = None,
+                 noise_cov: Optional[torch.Tensor] = None,
+                 inv_nc_lr: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                 os_grid: Optional[Union[float, Sequence[float]]] = 1.0,
+                 bparams: Optional[batching_params] = batching_params()):
+        """
+        Wrapper for the multi_apod_kern_linop_loop linear operator, without batching over N
+        
+        Args:
+        -----
+        trj : torch.Tensor
+            Trajectory of the k-space samples with shape (*trj_size, D)
+        mps : torch.Tensor
+            Sensitivity maps with shape (C, *im_size)
+        weights : torch.Tensor
+            the kernel weights with shape (L, *kern_size, *trj_size)
+        apods : torch.Tensor
+            the apodization functions with shape (L, *im_size)
+        dcf : Optional[torch.Tensor]
+            Density compensation function with shape (*trj_size)
+        noise_cov : Optional[torch.Tensor]
+            Noise covariance matrix with shape (*trj_size, C, C)
+        inv_nc_lr : Optional[Tuple[torch.Tensor, torch.Tensor]]
+            Inverse noise covariance in a low-rank approximation of size (*trj_size, L) and (L, nc, nc)
+        os_grid : Optional[float]
+            Oversampling factor for the grid
+            Can also be a sequence of floats for each dimension
+        bparams : Optional[batching_params]
+            Batching parameters for the linear operator
+        """
+
+        if dcf is not None:
+            dcf = dcf[None,]
+        if noise_cov is not None:
+            noise_cov = noise_cov[None,]
+        if inv_nc_lr is not None:
+            inl_a, inl_b = inv_nc_lr
+            inl_a = inl_a[None,]
+            inl_b = inl_b[None,]
+            inv_nc_lr = (inl_a, inl_b)
+
+        A = multi_apod_kern_linop_loop(
+            trj[None,], mps, weights[None,], apods[None,], dcf, noise_cov, inv_nc_lr, os_grid, bparams
+        )
+        super().__init__(A.ishape[1:], A.oshape[1:])
+        self.A = A
+
+    def forward(self,
+                img: torch.Tensor) -> torch.Tensor:
+        return self.A.forward(img[None,])[0]
+
+    def adjoint(self,
+                ksp: torch.Tensor) -> torch.Tensor:
+        return self.A.adjoint(ksp[None,])[0]
+
+    def normal(self,
+               img: torch.Tensor) -> torch.Tensor:
+        return self.A.normal(img[None,])[0]
+
+    def max_eig(self, N=1, verbose=False) -> torch.Tensor:
+        return self.A.max_eig(1, verbose=verbose)[0]

@@ -107,7 +107,6 @@ def als_iterations(phase_model: matvec,
                    max_iter: Optional[int] = 100,
                    tol: float = 5e-3,
                    check_convergence: bool = True,
-                   solver = 'pinv',
                    verbose: Optional[bool] = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform ALS iterations to solve for apodization functions and weights.
@@ -198,7 +197,7 @@ def lstsq_spatial(phase_model: matvec,
                   mask: Optional[torch.Tensor] = None,
                   k_batch_size: Optional[int] = None,
                   t_batch_size: Optional[int] = None,
-                  solver: Optional[str] = "chol",
+                  solver: Optional[str] = "pinv",
                   lamda: Optional[float] = 0.0,) -> torch.Tensor:
     """    
     This function optimizes for the apodization functions 
@@ -281,8 +280,6 @@ def lstsq_spatial(phase_model: matvec,
         apods = torch.zeros((Nvox, L), dtype=complex_dtype, device=torch_dev)
         AHA = AHA.reshape((Nvox, L, L))[inds, :, :]
         AHB = AHB.reshape((Nvox, L))[inds, :]
-        if Nvox < L:
-            solver = "pinv"
         apods[inds] = lin_solve(AHA, AHB[..., None], solver=solver, lamda=lamda)[..., 0]
         apods = apods.T.reshape((L, *im_size))
     else:
@@ -296,7 +293,7 @@ def lstsq_temporal(phase_model: matvec,
                    apods: torch.Tensor, 
                    mask: Optional[torch.Tensor] = None,
                    lk_batch_size: Optional[int] = None,
-                   solver: Optional[str] = "chol",
+                   solver: Optional[str] = "pinv",
                    lamda: Optional[float] = 0.0,) -> torch.Tensor:
     """
     This function optimizes for the weights given fixed apodization functions.
@@ -362,9 +359,6 @@ def lstsq_temporal(phase_model: matvec,
     AHB_flt = rearrange(AHB, 'L K ... -> (L K) (...)')
 
     # override solver to pinv if problem is small
-    if np.prod(trj_size) < L * K:
-        solver = "pinv"
-
     soln_flt = lin_solve(AHA_flt, AHB_flt, solver=solver, lamda=lamda) # (L K) (...)
     soln = soln_flt.reshape(AHB.shape)
         

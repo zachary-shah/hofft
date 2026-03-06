@@ -327,7 +327,7 @@ def als_hofft(phis: torch.Tensor,
             K = int(apods_init.split('_')[0])
             num_iter = int(apods_init.split('_')[-1])
             apods = K_alphas_apod_init(phis, alphas, hparams, 
-                                       method='minmax',
+                                       method='minmax', # TODO: kmeans better?
                                        apod_init_method=init_init_method,
                                        check_convergence=check_convergence,
                                        verbose=verbose,
@@ -354,7 +354,7 @@ def als_hofft(phis: torch.Tensor,
     if apods.shape[1:] != im_size:
         kwargs = {'order': 3, 'mode': 'nearest'}
         solve_size_tensor = torch.tensor(solve_size).to(torch_dev)
-        spatial_crds = (gen_grd(im_size).to(torch_dev) + 0.5) * solve_size_tensor
+        spatial_crds = (gen_grd(im_size, device=torch_dev) + 0.5) * solve_size_tensor
         apods = spatial_interp(apods, spatial_crds, **kwargs)
 
     if im_size != im_size_raw:
