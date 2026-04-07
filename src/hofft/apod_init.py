@@ -54,7 +54,7 @@ def pick_K_vectors(vectors: torch.Tensor,
         kvectors = vectors_noisy[idxs]
     elif method == 'minmax':
         picked = [torch.randint(0, N, (1,))]
-        dist = torch.linalg.norm(vectors_noisy - vectors_noisy[picked], dim=-1)
+        dist = torch.linalg.norm(vectors_noisy - vectors_noisy[tuple(picked)], dim=-1)
         for _ in range(1, K):
             nxt = torch.argmax(dist)
             picked.append(nxt)
