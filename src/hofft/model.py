@@ -17,10 +17,12 @@ from dataclasses import dataclass, field
 from .matvec import matvec, matvec_naive, matvec_type3
 
 __all__ = [
+    'looped_linop',
     'multi_apod_kern_linop', 
     'multi_apod_kern_linop_batch',
     'multi_apod_kern_linop_multishot',
     'multi_apod_kern_linop_loop',
+    'multi_apod_kern_linop_multishot',
     'hofft_params'
 ]
 
@@ -71,6 +73,7 @@ class hofft_params:
                 DeprecationWarning,
             )
             self.matvec_type = matvec_type3 if self.use_type3 else matvec_naive
+
 
 class multi_apod_kern_linop(linop):
     """
@@ -1141,7 +1144,28 @@ class multi_apod_kern_linop_parallel_sametrj(linop):
         return power_method_operator(self.normal, x0, verbose=verbose, num_iter=15)[1] * 1.05
 
 
-class multi_apod_kern_linop_loop(linop):
+class looped_linop(linop):
+    """
+    Base class for looped linear operators, which also define
+    max eigenvalue computation from just the first image in the loop.
+    """
+    def __init__(self, ishape, oshape, im_size, device, dtype):
+        super().__init__(ishape, oshape)
+        self.im_size = im_size
+        self.ishape = ishape
+        self.oshape = oshape
+        self.device = device
+        self.dtype = dtype
+
+    def max_eig(self, N=1, verbose=False, num_iter=15) -> torch.Tensor:
+        """
+        Compute max eigenvalue for N=1 assuming it doesn't change too much along the N dimension.
+        """
+        x0 = torch.randn((N, *self.im_size), device=self.device, dtype=self.dtype)
+        return power_method_operator(self.normal, x0, verbose=verbose, num_iter=num_iter)[1] * 1.05
+
+
+class multi_apod_kern_linop_loop(looped_linop):
     """
     Linear operator for multi-apodized kernels, with batching over N images.
     Loop over N in forward and adjoint.
@@ -1189,7 +1213,7 @@ class multi_apod_kern_linop_loop(linop):
         trj_size = trj.shape[1:-1]
         kern_size = weights.shape[2:-len(trj_size)]
         oshape = (N, mps.shape[0], *trj_size)
-        super().__init__((N, *im_size), oshape)
+        super().__init__((N, *im_size), oshape, im_size, mps.device, mps.dtype)
         
         # Consts
         D = trj.shape[-1]
@@ -1521,17 +1545,340 @@ class multi_apod_kern_linop_loop(linop):
             out[n1:n2] = (self.mps.conj().unsqueeze(0) * MFKy).sum(dim=1) # (N, *im_size)
 
         return out
+
+
+class multi_apod_kern_linop_loop_multishot(looped_linop):
+    """
+    Linear operator for multi-apodized kernels, with batching over N images.
+    Loop over N in forward and adjoint.
+    With explicit modeling of shot-to-shot phase variations from different interleaves.
+    """
+    def __init__(self, 
+                 trj: torch.Tensor,
+                 phi: torch.Tensor,
+                 mps: torch.Tensor,
+                 weights: torch.Tensor,
+                 apods: torch.Tensor,
+                 dcf: Optional[torch.Tensor] = None,
+                 os_grid: Optional[Union[float, Sequence[float]]] = 1.0,
+                 bparams: Optional[batching_params] = batching_params()):
+        """
+        Initialize the HOFFT linear operator.
+        Nomenclature:
+        - N: number of images (diffusion directions)
+        - T: number of timepoints
+        - P: number of shots/interleaves
+        - D: dimensionality of imaging (2 or 3)
+        
+        Args:
+        -----
+        trj : torch.Tensor
+            Trajectory of the k-space samples with shape (P, N, T, D)
+        phi: torch.Tensor
+            Shot-to-shot phase variations of shape (P, N, *im_size)
+        mps : torch.Tensor
+            Sensitivity maps with shape (C, *im_size)
+        weights : torch.Tensor
+            the kernel weights with shape (P, N, L, *kern_size)
+        apods : torch.Tensor
+            the apodization functions with shape (P, N, L, *im_size)
+        dcf : Optional[torch.Tensor]
+            Density compensation function with shape (P, N, T)
+        os_grid : Optional[float]
+            Oversampling factor for the grid
+            Can also be a sequence of floats for each dimension
+        bparams : Optional[batching_params]
+            Batching parameters for the linear operator
+        """
+        
+        im_size = mps.shape[1:]
+        assert all([im_size[i] % 2 == 0 for i in range(len(im_size))]), \
+            f"Image size must be even in all dimensions for HOFFT. im_size: {im_size}"
+        assert trj.ndim == 4, f"Trajectory must have shape (P, N, T, D). Got {trj.shape}"
+        P, N, T, d = trj.shape
+        C = mps.shape[0]
+        kern_size = weights.shape[3:-1]
+        oshape = (P, N, C, T)
+        super().__init__((N, *im_size), oshape, im_size, mps.device, mps.dtype)
+        
+        # Consts
+        D = trj.shape[-1]
+        L = weights.shape[2]
+        torch_dev = trj.device
+        assert mps.device == torch_dev
+        assert weights.device == torch_dev
+        assert apods.device == torch_dev
+        assert apods.shape == (P, N, L, *im_size), f"Apodization functions must have shape (N, P, L, *im_size). Got {apods.shape}"
+
+        # collapse (P, N) -> (PN)
+        PN = P * N
+        trj = trj.flatten(0, 1).contiguous()
+        weights = weights.flatten(0, 1).contiguous()
+        apods = apods.flatten(0, 1).contiguous()
+        dcf = dcf.flatten(0, 1).contiguous()
+        
+        # Make sure trajectory is on an oversampled grid
+        if isinstance(os_grid, (int, float)):
+            assert torch.allclose(trj, (trj * os_grid).round() / os_grid), \
+                f"Trajectory is not on an oversampled grid. os_grid: {os_grid}"
+            os_grid = [os_grid] * D
+        else:
+            assert len(os_grid) == D, f"os_grid must have length {D} for {D}-D trajectory."
+            for i in range(D):
+                assert torch.allclose(trj[..., i], (trj[..., i] * os_grid[i]).round() / os_grid[i]), \
+                    f"Trajectory is not on an oversampled grid in dimension {i}. os_grid: {os_grid}"
+            
+        # Default dcf
+        if dcf is None:
+            dcf = torch.ones(trj.shape[:-1], dtype=torch.float32, device=torch_dev)
+        else:
+            assert dcf.device == torch_dev
+        
+        # Trajectory of kernels
+        if np.prod(kern_size) == 1:
+            kern_vecs = torch.zeros(D, device=torch_dev)
+        else:
+            kern_vecs = gen_grd(kern_size, kern_size).reshape((-1, D)).to(torch_dev)
+
+        im_size_os = [round(im_size[i] * os_grid[i]) for i in range(D)]
+        im_size_os_tensor = torch.tensor(im_size_os, device=torch_dev)
+        os_grid_tensor = torch.tensor(os_grid, device=torch_dev)
+        idx_kerns = (einsum(trj, os_grid_tensor, "... d, d -> ... d")).round()
+        idx_kerns = (idx_kerns[..., None, :] + kern_vecs).type(torch.int32) # (PN, T, K, d)
+        idx_kerns = idx_kerns % im_size_os_tensor.type(torch.int32)
+        
+        # Store params
+        self.padder = PadLast(im_size_os, list(im_size))
+        self.im_size_os = im_size_os
+        self.im_size = im_size
+        self.mps = mps
+        self.os_grid = os_grid
+        self.dcf = dcf
+        self.idx_kerns = idx_kerns
+        self.idx_ravel = ravel(self.idx_kerns, self.im_size_os, dim=-1).to(torch.long).contiguous()
+
+        self.bparams = bparams
+        self.weights = weights.reshape((PN, L, -1, T)).mT.contiguous() # (PN, L, T, K)
+
+        self.mps = mps # (C, *im_size)
+        self.apods = apods # (PN, L, *im_size)
+        self.phi = torch.exp(1j * phi) # (P, N, *im_size)
+
+        # FFT optimizations
+        fdim = tuple(range(-D, 0))
+        if D == 2:
+            self.fft = lambda x: torch.fft.fft2(torch.fft.ifftshift(x, dim=fdim), dim=fdim, norm='ortho')
+            self.ifft = lambda x: torch.fft.fftshift(torch.fft.ifft2(x, dim=fdim, norm='ortho'), dim=fdim)
+        else:
+            self.fft = lambda x: torch.fft.fftn(torch.fft.ifftshift(x, dim=fdim), dim=fdim, norm='ortho')
+            self.ifft = lambda x: torch.fft.fftshift(torch.fft.ifftn(x, dim=fdim, norm='ortho'), dim=fdim)
+
+        self.PN = PN
+        self.N = N
+        self.P = P
+        self.D = D
+        self.C = C
+        self.L = L
+        self.T = T
+        self.K = self.weights.shape[-1]
+
+    def forward(self,
+                img: torch.Tensor) -> torch.Tensor:
+        """
+        Applies forward model to image to get k-space data.
+        
+        Parameters
+        ----------
+        img : torch.Tensor
+            The image to be transformed with shape (N, *im_size)
+        
+        Returns
+        -------
+        torch.Tensor
+            The k-space data with shape (P, N, C, T)
+        """
+        # Consts
+        N, P, C = img.shape[0], self.P, self.C
+        PN = N * P
+        cbs = self.bparams.coil_batch_size or C
+        ibs = self.bparams.img_batch_size or PN
+
+        # Output tensor
+        ksp = torch.zeros((PN, *self.oshape[2:]), device=img.device, dtype=torch.complex64)
+
+        max_ib = min(ibs, PN)
+        max_cb = min(cbs, C)
+        rav_shape = self.idx_ravel.shape[1:]
+        blocks = torch.empty((max_ib, max_cb, self.L, self.T, self.K),
+                             device=img.device, dtype=torch.complex64)
+
+        # apply low-res phase variations
+        img = (img[None,] * self.phi[:, :N]).reshape(PN, *self.im_size) # (P * N, *im_size)
+
+        # batch over images
+        for n1, n2 in batch_iterator(PN, ibs):
+            batch = n2 - n1
+            idx_batch = self.idx_ravel[n1:n2].reshape(batch, 1, 1, -1)
+            
+            # Batch over coils
+            for c1, c2 in batch_iterator(C, cbs):
+                cbatch = c2 - c1
+
+                # mps / apods
+                Sx = img[n1:n2, None] * self.mps[c1:c2][None, :, :] # N, C, *im_size
+                MSx = Sx[:, :, None] * self.apods[n1:n2, None, :] # N, C, L, *im_size
+
+                # Oversampled FFT
+                MSx = self.padder(MSx)
+                FMSx = self.fft(MSx)
+
+                # Indexing
+                FMSx_flat = FMSx.reshape(batch, cbatch, self.L, -1)
+                blocks_flat = torch.gather(FMSx_flat, -1, idx_batch.expand(-1, cbatch, self.L, -1))
+                blocks[:batch, :cbatch] = blocks_flat.reshape(batch, cbatch, self.L, *rav_shape)
+
+                # Apply kernels
+                ksp[n1:n2, c1:c2] = einsum(blocks[:batch, :cbatch], self.weights[n1:n2], 'N C L ... K, N L ... K -> N C ...')
+                
+        return ksp.unflatten(0, (P, N))
     
-    def max_eig(self, N=1, verbose=False) -> torch.Tensor:
+    def adjoint(self,
+                ksp: torch.Tensor) -> torch.Tensor:
         """
-        Compute max eigenvalue of A^H Phi A efficiently given noise covariance screwing things 
-        up along the N dimension.
+        Applies adjoint model to k-space data to get image.
+        
+        Parameters
+        ----------
+        ksp : torch.Tensor
+            The k-space data with shape (P, N, C, T)
+        
+        Returns
+        -------
+        torch.Tensor
+            The image with shape (N, *im_size)
         """
-        x0 = torch.randn((N, *self.im_size), device=self.mps.device, dtype=self.mps.dtype)
-        return power_method_operator(self.normal, x0, verbose=verbose, num_iter=15)[1] * 1.05
+        # Consts
+        P, N, C, L = self.P, ksp.shape[1], self.C, self.L
+        PN = P * N
+        
+        ksp = ksp.flatten(0, 1).contiguous() # (PN, C, T)
+
+        cbs = self.bparams.coil_batch_size or C
+        ibs = self.bparams.img_batch_size or PN
+
+        # Output tensor
+        img = torch.zeros((PN, *self.ishape[1:]), device=ksp.device, dtype=torch.complex64)
+
+        max_ib = min(ibs, PN)
+        max_cb = min(cbs, C)
+
+        Kygrid = torch.empty((max_ib, max_cb, self.L, *self.im_size_os), device=ksp.device, dtype=torch.complex64)
+
+        # dcf
+        ksp = ksp * self.dcf[:, None,]
+
+        # Batch over coils
+        for n1, n2 in batch_iterator(PN, ibs):
+            batch = n2 - n1
+            idx_batch = self.idx_ravel[n1:n2].reshape(batch, 1, 1, -1)
+            for c1, c2 in batch_iterator(C, cbs):
+                cbatch = c2 - c1
+
+                # Get Kernels
+                Kyf = einsum(ksp[n1:n2, c1:c2], self.weights[n1:n2].conj(), 'N C ..., N L ... K -> N C L ... K').reshape(batch, cbatch, L, -1)
+
+                # Gridding
+                Kygrid_view = Kygrid[:batch, :cbatch]
+                Kygrid_view.zero_()
+                scatter_idx = idx_batch.expand(-1, cbatch, self.L, -1)
+                Kygrid_view.reshape(batch, cbatch, L, -1).scatter_add_(-1, scatter_idx, Kyf)
+
+                # Oversampled IFFT
+                FKy = self.ifft(Kygrid_view) # (N, C, L, *im_size_os)
+                FKy = self.padder.adjoint(FKy) # (N, C, L, *im_size)
+
+                # Apply adjoint mps and apods to image
+                MFKy = (self.apods.conj()[n1:n2, None] * FKy).sum(dim=2) # (N, C, *im_size)
+                img[n1:n2] += (self.mps[c1:c2].conj()[None] * MFKy).sum(dim=1) # (N, *im_size)
+        
+        # undo shot-to-shot phase
+        img = (img.unflatten(0, (P, N)) * self.phi[:, :N].conj()).sum(dim=0)
+        
+        return img
+    
+    def normal(self,
+               img: torch.Tensor) -> torch.Tensor:
+        """
+        Applies forward model and adjoint model to image to get normal operator.
+        
+        Parameters
+        ----------
+        img : torch.Tensor
+            The image to be transformed with shape (N, *im_size)
+            
+        Returns
+        -------
+        torch.Tensor
+            The response image with shape (N, *im_size)
+        """
+        # Consts
+        N, P, C, L = img.shape[0], self.P, self.C, self.L
+        PN = P * N
+        ibs = self.bparams.img_batch_size or PN
+        max_ib = min(ibs, PN)
+        rav_shape = self.idx_ravel.shape[1:]
+
+        # apply low-res phase variations
+        img = (img[None,] * self.phi[:, :N]).reshape(PN, *self.im_size) # (P * N, *im_size)
+
+        out = torch.zeros_like(img)
+
+        # temp arrays
+        Kygrid = torch.empty((max_ib, C, L, *self.im_size_os), device=img.device, dtype=torch.complex64)
+
+        # batch over images
+        for n1, n2 in batch_iterator(PN, ibs):
+            batch = n2 - n1
+            idx_batch = self.idx_ravel[n1:n2].reshape(batch, 1, 1, -1)
+
+            # mps / apods
+            Sx = img[n1:n2, None] * self.mps[None, :, :] # N, C, *im_size
+            MSx = Sx[:, :, None] * self.apods[n1:n2, None, :] # N, C, L, *im_size
+
+            # Oversampled FFT
+            MSx = self.padder(MSx)
+            FMSx = self.fft(MSx)
+
+            # Indexing
+            FMSx_flat = FMSx.reshape(batch, C, L, -1)
+            blocks_flat = torch.gather(FMSx_flat, -1, idx_batch.expand(-1, C, L, -1))
+
+            # Apply kernels
+            ksp = einsum(blocks_flat.reshape(batch, C, L, *rav_shape), self.weights[n1:n2], 'N C L ... K, N L ... K -> N C ...')
+            ksp = ksp * self.dcf[n1:n2, None,]
+            Kyf = einsum(ksp, self.weights[n1:n2].conj(), 'N C ..., N L ... K -> N C L ... K').reshape(batch, C, L, -1)
+
+            # Gridding
+            Kygrid_view = Kygrid[:batch]
+            Kygrid_view.zero_()
+            scatter_idx = idx_batch.expand(-1, C, L, -1)
+            Kygrid_view.reshape(batch, C, L, -1).scatter_add_(-1, scatter_idx, Kyf)
+
+            # Oversampled IFFT
+            FKy = self.ifft(Kygrid_view) # (N, C, L, *im_size_os)
+            FKy = self.padder.adjoint(FKy) # (N, C, L, *im_size)
+
+            # Apply adjoint mps and apods to image (in place)
+            MFKy = (self.apods.conj()[n1:n2, None] * FKy).sum(dim=2) # (N, C, *im_size)
+            out[n1:n2] = (self.mps.conj()[None] * MFKy).sum(dim=1) # (N, *im_size)
+
+        # undo shot-to-shot phase
+        out = (out.unflatten(0, (P, N)) * self.phi[:, :N].conj()).sum(dim=0)
+
+        return out
 
 
-class multi_apod_kern_linop_nobatch(linop):
+class multi_apod_kern_linop_nobatch(looped_linop):
     def __init__(self, 
                  trj: torch.Tensor,
                  mps: torch.Tensor,
@@ -1581,7 +1928,7 @@ class multi_apod_kern_linop_nobatch(linop):
         A = multi_apod_kern_linop_loop(
             trj[None,], mps, weights[None,], apods[None,], dcf, noise_cov, inv_nc_lr, os_grid, bparams
         )
-        super().__init__(A.ishape[1:], A.oshape[1:])
+        super().__init__(A.ishape[1:], A.oshape[1:], A.im_size, A.device, A.dtype)
         self.A = A
 
     def forward(self,
