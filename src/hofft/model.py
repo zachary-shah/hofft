@@ -20,9 +20,10 @@ __all__ = [
     'looped_linop',
     'multi_apod_kern_linop', 
     'multi_apod_kern_linop_batch',
-    'multi_apod_kern_linop_multishot',
+    'multi_apod_kern_linop_parallel_sametrj',
     'multi_apod_kern_linop_loop',
     'multi_apod_kern_linop_multishot',
+    'multi_apod_kern_linop_nobatch',
     'hofft_params'
 ]
 
@@ -335,10 +336,12 @@ class multi_apod_kern_linop_batch(linop):
                  dcf: Optional[torch.Tensor] = None,
                  noise_cov: Optional[torch.Tensor] = None,
                  inv_nc_lr: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                 bgnd_phase: Optional[torch.Tensor] = None,
                  os_grid: Optional[Union[float, Sequence[float]]] = 1.0,
                  bparams: Optional[batching_params] = batching_params()):
         """
-        Initialize the HOFFT linear operator.
+        Linop for having the same A (weights/apods) across all items in a batch (across N).
+        Optionally have different noise covariance or background phase for each item in N.
         
         Args:
         -----
@@ -356,6 +359,8 @@ class multi_apod_kern_linop_batch(linop):
             the k-space noise covariance matrix with shape (N, *trj_size, nc, nc)
         inv_nc_lr : Optional[Tuple[torch.Tensor, torch.Tensor]]
             Inverse noise covariance in a low-rank approximation of size (N, *trj_size, L) and (N, L, nc, nc)
+        bgnd_phase : Optional[torch.Tensor]
+            Per-batch phase with shape (N, *im_size)
         os_grid : Optional[float]
             Oversampling factor for the grid
             Can also be a sequence of floats for each dimension
@@ -378,6 +383,10 @@ class multi_apod_kern_linop_batch(linop):
         assert weights.device == torch_dev
         assert apods.device == torch_dev
         assert apods.shape[0] == L
+
+        if bgnd_phase is not None:
+            assert torch.is_complex(bgnd_phase), "bgnd_phase must be complex already"
+            self.bgnd_phase = bgnd_phase.to(torch_dev)
         
         # Make sure trajectory is on an oversampled grid
         if isinstance(os_grid, (int, float)):
@@ -516,6 +525,9 @@ class multi_apod_kern_linop_batch(linop):
         cbs = self.bparams.coil_batch_size
         ibs = self.bparams.img_batch_size
 
+        if self.bgnd_phase is not None:
+            img = img * self.bgnd_phase[:N]
+
         # Output tensor
         ksp = torch.zeros((N, *self.oshape), device=img.device, dtype=torch.complex64)
         
@@ -599,219 +611,10 @@ class multi_apod_kern_linop_batch(linop):
                 
                 # Update image
                 img[n1:n2] += MSFKy
-            
-        return img
-    
-    def normal(self,
-               img: torch.Tensor) -> torch.Tensor:
-        """
-        Applies forward model and adjoint model to image to get normal operator.
         
-        Parameters
-        ----------
-        img : torch.Tensor
-            The image to be transformed with shape (*im_size)
-            
-        Returns
-        -------
-        torch.Tensor
-            The response image with shape (*im_size)
-        """
-        
-        return self.adjoint(self.forward(img))
+        if self.bgnd_phase is not None:
+            img = img * self.bgnd_phase[:N].conj()
 
-
-class multi_apod_kern_linop_multishot(linop):
-    """
-    Linear operator for multi-apodized kernels.
-
-    With explicit modeling of shot-to-shot phase variations from different interleaves.
-    """
-
-    def __init__(self, 
-                 trj: torch.Tensor,
-                 phi: torch.Tensor,
-                 mps: torch.Tensor,
-                 weights: torch.Tensor,
-                 apods: torch.Tensor,
-                 dcf: Optional[torch.Tensor] = None,
-                 os_grid: Optional[Union[float, Sequence[float]]] = 1.0,
-                 bparams: Optional[batching_params] = batching_params()):
-        """
-        Initialize the HOFFT linear operator.
-        T: timepoints
-        P: number of shots/interleaves
-
-        Args:
-        -----
-        trj : torch.Tensor
-            Trajectory of the k-space samples with shape (T, P, D)
-        phi: torch.Tensor
-            Shot-to-shot phase variations of shape (P, *im_size)
-        mps : torch.Tensor
-            Sensitivity maps with shape (C, *im_size)
-        weights : torch.Tensor
-            the kernel weights with shape (L, *kern_size, T, P)
-        apods : torch.Tensor
-            the apodization functions with shape (L, *im_size)
-        dcf : Optional[torch.Tensor]
-            Density compensation function with shape (T, P)
-        os_grid : Optional[float]
-            Oversampling factor for the grid
-            Can also be a sequence of floats for each dimension
-        bparams : Optional[batching_params]
-            Batching parameters for the linear operator
-        """
-        im_size = mps.shape[1:]
-        assert all([im_size[i] % 2 == 0 for i in range(len(im_size))]), \
-            f"Image size must be even in all dimensions for HOFFT. im_size: {im_size}"
-        trj_size = trj.shape[:-1]
-        kern_size = weights.shape[1:-len(trj_size)]
-        oshape = (mps.shape[0], *trj_size)
-        super().__init__(im_size, oshape)
-        
-        # Consts
-        D = trj.shape[-1]
-        L = weights.shape[0]
-        torch_dev = trj.device
-        assert mps.device == torch_dev
-        assert weights.device == torch_dev
-        assert apods.device == torch_dev
-        assert apods.shape[0] == L
-        
-        # Make sure trajectory is on an oversampled grid
-        if isinstance(os_grid, (int, float)):
-            assert torch.allclose(trj, (trj * os_grid).round() / os_grid), \
-                f"Trajectory is not on an oversampled grid. os_grid: {os_grid}"
-            os_grid = [os_grid] * D
-        else:
-            assert len(os_grid) == D, f"os_grid must have length {D} for {D}-D trajectory."
-            for i in range(D):
-                assert torch.allclose(trj[..., i], (trj[..., i] * os_grid[i]).round() / os_grid[i]), \
-                    f"Trajectory is not on an oversampled grid in dimension {i}. os_grid: {os_grid}"
-            
-        # Default dcf
-        if dcf is None:
-            dcf = torch.ones(trj.shape[:-1], dtype=torch.float32, device=torch_dev)
-        else:
-            assert dcf.device == torch_dev
-        
-        # Trajectory of kernels
-        if np.prod(kern_size) == 1:
-            kern_vecs = torch.zeros(D, device=torch_dev)
-        else:
-            kern_vecs = gen_grd(kern_size, kern_size).reshape((-1, D)).to(torch_dev)
-        
-        im_size_os = [round(im_size[i] * os_grid[i]) for i in range(D)]
-        im_size_os_tensor = torch.tensor(im_size_os, device=torch_dev)
-        os_grid_tensor = torch.tensor(os_grid, device=torch_dev)
-        idx_kerns = (einsum(trj, os_grid_tensor, "T P d, d -> T P d")).round() + im_size_os_tensor // 2
-        idx_kerns = (idx_kerns[..., None, :] + kern_vecs).type(torch.int32) # (T, P, K, d)
-        idx_kerns = idx_kerns % im_size_os_tensor.type(torch.int32)
-        
-        # Store params
-        self.padder = PadLast(im_size_os, list(im_size))
-        self.im_size_os = im_size_os
-        self.im_size = im_size
-        self.mps = mps[None, :] * phi[:, None] # (P, C, *im_size) # apply phase to sensitivity maps
-        self.os_grid = os_grid
-        self.dcf = dcf
-        self.idx_kerns = idx_kerns
-        self.bparams = bparams
-        self.weights = weights.reshape((L, -1, *trj_size))
-        self.apods = apods
-        self.P = trj.shape[1]
-
-    def forward(self,
-                img: torch.Tensor) -> torch.Tensor:
-        """
-        Applies forward model to image to get k-space data.
-        
-        Parameters
-        ----------
-        img : torch.Tensor
-            The image to be transformed with shape (*im_size)
-        
-        Returns
-        -------
-        torch.Tensor
-            The k-space data with shape (C, *trj_size)
-        """
-        # Consts
-        D = self.idx_kerns.shape[-1]
-        C = self.mps.shape[0]
-        cbs = self.bparams.coil_batch_size
-        
-        # Output tensor
-        ksp = torch.zeros(self.oshape, device=img.device, dtype=torch.complex64)
-        
-        # Batch over coils
-        for c1, c2 in batch_iterator(C, cbs):
-            # Apply sensitivity maps to image
-            Sx = self.mps[:, c1:c2] * img[None, None].abs() # (C, P, *im_size)
-            
-            # Apply apods to image
-            MSx = einsum(Sx, self.apods, 'P C ..., L ... -> P C L ...')
-            
-            # Oversampled FFT per shot
-            MSx = self.padder(MSx)
-
-            for p in range(self.P):
-                FMSx = fft(MSx[p], dim=tuple(range(-D, 0))) # (C, L, ...)
-                
-                # Extract blocks of k-space data
-                blocks = multi_index(FMSx, D, self.idx_kerns[:, p]) # (C, L, T, K)
-                blocks = blocks.moveaxis(-1, 2) # (C, L, K, T)
-                
-                # Apply kernels
-                ksp[c1:c2, :, p] = einsum(blocks, self.weights[..., p], 'C L K ..., L K ... -> C ...')
-            
-        return ksp
-    
-    def adjoint(self,
-                ksp: torch.Tensor) -> torch.Tensor:
-        """
-        Applies adjoint model to k-space data to get image.
-        
-        Parameters
-        ----------
-        ksp : torch.Tensor
-            The k-space data with shape (C, *trj_size)
-        
-        Returns
-        -------
-        torch.Tensor
-            The image with shape (*im_size)
-        """
-        # Consts
-        D = self.idx_kerns.shape[-1]
-        C = self.mps.shape[0]
-        cbs = self.bparams.coil_batch_size
-        
-        # Output tensor
-        img = torch.zeros(self.ishape, device=ksp.device, dtype=torch.complex64)
-        
-        # Batch over coils
-        for c1, c2 in batch_iterator(C, cbs):
-            for p in range(self.P):
-                # Get Kernels
-                y = ksp[c1:c2, :, p] * self.dcf[:, p]
-                Ky = einsum(y, self.weights.conj()[..., p], 'C T, L K T -> C L T K')
-                
-                # Gridding 
-                Ky = multi_grid(Ky, self.idx_kerns[:, p], self.im_size_os) # (C, L, *im_size_os)
-                FKy = ifft(Ky, dim=tuple(range(-D, 0)))
-                FKy = self.padder.adjoint(FKy) # (C, L, *im_size)
-                
-                # Apply adjoint sensitivity maps
-                SFKy = (self.mps[p, c1:c2, None,].conj() * FKy).sum(dim=0) # L, *im_size
-                
-                # Apply adjoint source maps
-                MSFKy = (SFKy * self.apods.conj()).sum(dim=0)
-                
-                # Update image
-                img += MSFKy.abs()
-        
         return img
     
     def normal(self,
@@ -1579,7 +1382,7 @@ class multi_apod_kern_linop_loop_multishot(looped_linop):
         mps : torch.Tensor
             Sensitivity maps with shape (C, *im_size)
         weights : torch.Tensor
-            the kernel weights with shape (P, N, L, *kern_size)
+            the kernel weights with shape (P, N, L, *kern_size, T)
         apods : torch.Tensor
             the apodization functions with shape (P, N, L, *im_size)
         dcf : Optional[torch.Tensor]
@@ -1590,7 +1393,7 @@ class multi_apod_kern_linop_loop_multishot(looped_linop):
         bparams : Optional[batching_params]
             Batching parameters for the linear operator
         """
-        
+
         im_size = mps.shape[1:]
         assert all([im_size[i] % 2 == 0 for i in range(len(im_size))]), \
             f"Image size must be even in all dimensions for HOFFT. im_size: {im_size}"
